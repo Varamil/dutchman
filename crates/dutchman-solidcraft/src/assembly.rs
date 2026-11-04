@@ -114,7 +114,7 @@ pub(crate) fn write(
         report.push(
             Severity::Info,
             "joints",
-            "assembly joints left out by choice; stored placements retained",
+            "assembly joints left out by choice; selected placements retained",
         );
     }
     let has_appearances = report_appearance_bindings(model, report);
@@ -366,7 +366,7 @@ pub(crate) fn plan(writer: &SolidCraftWriter, assembly: &Assembly, report: &mut 
         report.push(
             Severity::Info,
             "joints",
-            "assembly joints left out by choice; stored placements retained",
+            "assembly joints left out by choice; selected placements retained",
         );
     }
     let mut checks = Vec::new();
