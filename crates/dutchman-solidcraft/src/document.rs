@@ -58,7 +58,7 @@ pub(crate) fn import_design(model: &Model, step_blob: &str) -> Value {
 
 /// Applies explicit import body names and their definition-level looks.
 pub(crate) fn import_looks(doc: &mut Value, looks: &History) {
-    if let Some(names) = looks.features.first().and_then(|f| f.get("body_names")) {
+    if let Some(names) = looks.import_body_names() {
         if let Some(fields) = doc
             .get_mut("features")
             .and_then(Value::as_array_mut)
@@ -76,6 +76,53 @@ pub(crate) fn import_looks(doc: &mut Value, looks: &History) {
             "appearances".to_owned(),
             json!({"bodies": looks.looks, "faces": looks.face_looks}),
         );
+    }
+}
+
+/// Names and colours the visible final shape beside an editable history copy.
+pub(crate) fn original_looks(doc: &mut Value, looks: &History) {
+    if let Some(names) = looks.import_body_names() {
+        if let Some(fields) = doc
+            .get_mut("features")
+            .and_then(Value::as_array_mut)
+            .and_then(|features| {
+                features
+                    .iter_mut()
+                    .find(|f| f.get("name").and_then(Value::as_str) == Some(ORIGINAL))
+            })
+            .and_then(Value::as_object_mut)
+        {
+            fields.insert("body_names".to_owned(), names.clone());
+        }
+    }
+    if looks.looks.is_empty() && looks.face_looks.is_empty() {
+        return;
+    }
+    let Some(fields) = doc.as_object_mut() else {
+        return;
+    };
+    let appearances = fields.entry("appearances").or_insert_with(|| json!({}));
+    let Some(appearances) = appearances.as_object_mut() else {
+        return;
+    };
+    if let Some(bodies) = appearances
+        .entry("bodies")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+    {
+        bodies.extend(
+            looks
+                .looks
+                .iter()
+                .map(|(name, look)| (name.clone(), look.clone())),
+        );
+    }
+    if let Some(faces) = appearances
+        .entry("faces")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+    {
+        faces.extend(looks.face_looks.iter().cloned());
     }
 }
 
@@ -365,6 +412,7 @@ mod history_tests {
 
     fn history() -> History {
         History {
+            default_bodies: Default::default(),
             params: vec![json!({"name": "d1", "expr": "10 mm", "unit": "mm", "model": true})],
             features: vec![
                 json!({"id": 1, "name": "Sketch1", "type": "sketch", "suppressed": false}),

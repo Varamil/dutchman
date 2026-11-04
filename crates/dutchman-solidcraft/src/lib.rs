@@ -386,20 +386,46 @@ impl SolidCraftWriter {
         step: &str,
         live: Live,
     ) -> Result<Vec<u8>, Error> {
+        self.history_design_report(model, history, step, live, &mut Report::default())
+    }
+
+    fn history_design_report(
+        &self,
+        model: &Model,
+        history: &history::History,
+        step: &str,
+        live: Live,
+        report: &mut Report,
+    ) -> Result<Vec<u8>, Error> {
         let mut design = if live == Live::Whole {
             container::Container::empty()
         } else {
             container::Container::new(step.as_bytes())?
         };
         let mut history = history.clone();
+        history.preserve_import_names();
         history::base::store(&mut history.features, &mut design)?;
-        let doc: Value = document::history_design(
+        let mut doc: Value = document::history_design(
             model,
             &history,
             design.step_blob(),
             live,
             self.resolved_version(),
         );
+        if matches!(live, Live::Partial | Live::Unverified) {
+            let mut looks = history::imported(model, step, report, false)?;
+            let mut taken: history::BodyNames = history
+                .features
+                .iter()
+                .filter_map(|feature| feature.get("body_names").and_then(Value::as_array))
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            taken.add_defaults(history.default_bodies.keys().cloned());
+            looks.rename_bodies("Original geometry", &mut taken);
+            document::original_looks(&mut doc, &looks);
+        }
         design.finish(&doc)
     }
 
@@ -1035,7 +1061,8 @@ impl Writer for SolidCraftWriter {
                     if let Check::Partial(message) = &check {
                         report.push(Severity::Degraded, HISTORY, message);
                     }
-                    let written = self.history_design(model, history, &step, Live::Partial)?;
+                    let written =
+                        self.history_design_report(model, history, &step, Live::Partial, report)?;
                     // Check the visible original separately: hidden editable bodies also
                     // appear in SolidCraft's numerical eval result.
                     let original = self.history_design(model, history, &step, Live::Original)?;
@@ -1090,8 +1117,13 @@ impl Writer for SolidCraftWriter {
                                 HISTORY,
                                 &message,
                             );
-                            let written =
-                                self.history_design(model, history, &step, Live::Unverified)?;
+                            let written = self.history_design_report(
+                                model,
+                                history,
+                                &step,
+                                Live::Unverified,
+                                report,
+                            )?;
                             (
                                 written,
                                 Outcome {
