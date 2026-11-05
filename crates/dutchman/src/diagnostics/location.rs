@@ -28,16 +28,20 @@ pub fn default_folder() -> Result<PathBuf, String> {
     }
 }
 
-/// Create a uniquely named log at UTC start time and retain the newest ten logs.
+/// Create a uniquely named log at UTC start time and retain the newest [`KEEP_LOGS`] logs.
 pub fn new_default_log() -> Result<PathBuf, String> {
-    let folder = default_folder()?;
+    new_log_in(&default_folder()?)
+}
+
+/// Like [`new_default_log`], in `folder` rather than the platform's diagnostic folder.
+pub fn new_log_in(folder: &Path) -> Result<PathBuf, String> {
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|err| format!("cannot read UTC start time: {err}; use --diagnostics PATH"))?
         .as_secs();
     let stamp =
         utc_timestamp(seconds).ok_or("cannot format UTC start time; use --diagnostics PATH")?;
-    create_log(&folder, &stamp)
+    create_log(folder, &stamp)
 }
 
 fn utc_timestamp(seconds: u64) -> Option<String> {
@@ -233,13 +237,17 @@ fn logs(folder: &Path) -> Vec<PathBuf> {
     logs
 }
 
+/// How many automatically placed logs are kept. The desktop app names a run's log in the prompt it
+/// copies for an AI assistant, so a log has to outlive a good number of later runs.
+pub const KEEP_LOGS: usize = 50;
+
 fn retain(folder: &Path, current: &Path) -> Result<(), String> {
     // Keep the new file even on a filesystem with coarse modification timestamps.
     let older: Vec<_> = logs(folder)
         .into_iter()
         .filter(|path| path != current)
         .collect();
-    for path in older.into_iter().skip(9) {
+    for path in older.into_iter().skip(KEEP_LOGS - 1) {
         std::fs::remove_file(&path)
             .map_err(|err| format!("cannot remove old diagnostic log {}: {err}", path.display()))?;
     }
@@ -248,7 +256,12 @@ fn retain(folder: &Path, current: &Path) -> Result<(), String> {
 
 /// Newest default log with an unfinished conversion, for the app's launch notice.
 pub fn unfinished_default_log() -> Option<PathBuf> {
-    let path = logs(&default_folder().ok()?).into_iter().next()?;
+    unfinished_log_in(&default_folder().ok()?)
+}
+
+/// Newest log in `folder` with an unfinished conversion.
+pub fn unfinished_log_in(folder: &Path) -> Option<PathBuf> {
+    let path = logs(folder).into_iter().next()?;
     unfinished(&path).then_some(path)
 }
 
@@ -336,10 +349,10 @@ mod tests {
         std::fs::write(dir.path().join("notes.jsonl"), "keep").unwrap();
         std::fs::create_dir(dir.path().join("2026-10-29_201500-99.jsonl")).unwrap();
         let mut paths = Vec::new();
-        for _ in 0..12 {
+        for _ in 0..KEEP_LOGS + 2 {
             paths.push(create_log(dir.path(), "2026-10-29_201500").unwrap());
         }
-        assert_eq!(logs(dir.path()).len(), 10);
+        assert_eq!(logs(dir.path()).len(), KEEP_LOGS);
         let unique: std::collections::BTreeSet<_> = paths.iter().collect();
         assert_eq!(unique.len(), paths.len());
         assert!(paths.last().unwrap().is_file());
@@ -410,14 +423,14 @@ mod tests {
         for result in ["converted", "failed", "stopped", "running"]
             .into_iter()
             .cycle()
-            .take(12)
+            .take(KEEP_LOGS + 2)
         {
             let path = create_log(dir.path(), "2026-11-02_163710").unwrap();
             if result != "running" {
                 finish_default_log(&path, result);
             }
         }
-        assert_eq!(logs(dir.path()).len(), 10);
+        assert_eq!(logs(dir.path()).len(), KEEP_LOGS);
         assert!(!legacy.exists());
         assert!(!legacy_counter.exists());
     }
