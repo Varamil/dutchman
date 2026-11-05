@@ -149,7 +149,12 @@ pub(crate) fn map(feature: &Value, definition: &Value, ctx: &mut Context) -> Res
     if definition.get("solid").and_then(Value::as_bool) == Some(false) {
         return Err("sheet extrudes are not mapped yet".to_owned());
     }
-    let operation = operation(definition.get("op"))?;
+    let operation = match operation(definition.get("op"))? {
+        // A join before any feature built a body has nothing to join: it makes the first body,
+        // which is then named like any other new body.
+        "join" if !ctx.builds => "new_body",
+        operation => operation,
+    };
     if operation == "cut"
         && extent.get("through_all").and_then(Value::as_bool) == Some(true)
         && ctx.named_bodies.is_empty()
@@ -367,7 +372,8 @@ pub(super) fn operation(op: Option<&Value>) -> Result<&'static str, String> {
     }
 }
 
-/// The names of the bodies a new-body extrude makes, when the source names them all.
+/// The names of the bodies a new-body extrude makes. A body the source leaves unnamed gets
+/// "Body N", the first number not yet taken, so later features can still target it.
 ///
 /// Each named body's colour is recorded in `ctx.looks` under its name, so the replayed body
 /// keeps the colour the source gave it.
@@ -387,7 +393,12 @@ pub(super) fn body_names(
         .iter()
         .map(|id| ctx.row("bodies", id.as_str()?))
         .collect::<Option<_>>()?;
-    let names: Vec<String> = rows
+    let mut taken: std::collections::BTreeSet<String> = ctx
+        .named_bodies
+        .iter()
+        .map(|(_, name)| name.clone())
+        .collect();
+    let given: Vec<Option<String>> = rows
         .iter()
         .map(|row| {
             row.get("name")
@@ -395,7 +406,21 @@ pub(super) fn body_names(
                 .filter(|name| !name.trim().is_empty())
                 .map(str::to_owned)
         })
-        .collect::<Option<_>>()?;
+        .collect();
+    taken.extend(given.iter().flatten().cloned());
+    let mut next = 1;
+    let names: Vec<String> = given
+        .into_iter()
+        .map(|name| {
+            name.unwrap_or_else(|| loop {
+                let candidate = format!("Body {next}");
+                next += 1;
+                if taken.insert(candidate.clone()) {
+                    break candidate;
+                }
+            })
+        })
+        .collect();
     for (row, name) in rows.iter().zip(&names) {
         if let Some(look) = row.get("color").and_then(look) {
             ctx.looks.insert(name.clone(), look);
