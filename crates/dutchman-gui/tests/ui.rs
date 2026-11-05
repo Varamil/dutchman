@@ -1587,16 +1587,37 @@ mod consent_e2e {
         harness.state_mut().add_inputs([input]);
         harness.state_mut().set_out_dir(out.path().to_path_buf());
         harness.state_mut().set_verify(false);
+        // A log path as long as a Windows temp folder's, so every platform checks that a
+        // long "Run log:" line keeps to one line and leaves the buttons beside it alone.
+        let logs = [
+            "Users",
+            "RUNNERADMIN",
+            "AppData",
+            "Local",
+            "Temp",
+            ".tmpAbCdEf",
+        ]
+        .iter()
+        .fold(out.path().to_path_buf(), |dir, part| dir.join(part));
+        std::fs::create_dir_all(&logs).unwrap();
         harness
             .state_mut()
-            .set_diagnostic_log(out.path().join("diagnostics.jsonl"));
+            .set_diagnostic_log(logs.join("diagnostics.jsonl"));
         convert(&mut harness);
         assert_eq!(harness.state().rows()[0].status, Status::Failed);
         harness.get_by_label("RESULTS").scroll_to_me();
         harness.run_steps(8);
         assert!(harness.query_by_label("0 converted, 1 failed").is_some());
         let diagnose = harness.get_by_label("Diagnose this file").rect();
-        assert!(diagnose.top() > 70.0 && diagnose.bottom() < 730.0);
+        assert!(
+            diagnose.top() > 70.0 && diagnose.bottom() < 730.0,
+            "{diagnose:?}"
+        );
+        let show = harness.get_by_label("Show this run's log").rect();
+        assert!(
+            show.height() < 40.0,
+            "Show this run's log is squeezed: {show:?}"
+        );
         if capture_walkthrough {
             walkthrough(&mut harness, "01-failed-card");
         }
@@ -2373,7 +2394,10 @@ fn run_log_buttons_share_the_batch_log_and_review_names_it() {
     assert_eq!(harness.query_all_by_label("Copy log to…").count(), 2);
     assert_eq!(
         harness
-            .query_all_by_label(&dutchman_gui::platform::display_path(&log))
+            .query_all_by_label(&format!(
+                "Run log: {}",
+                dutchman_gui::platform::display_path(&log)
+            ))
             .count(),
         2
     );
@@ -2386,7 +2410,10 @@ fn run_log_buttons_share_the_batch_log_and_review_names_it() {
     harness.run_steps(8);
     harness
         .get_by_label("Send a problem report")
-        .get_by_label(&dutchman_gui::platform::display_path(&log));
+        .get_by_label(&format!(
+            "Run log: {}",
+            dutchman_gui::platform::display_path(&log)
+        ));
     harness.get_by_label("This run's log contains no names or contents from the design. It is kept locally; Send uploads only the summary or bundle reviewed below.");
 }
 
@@ -3039,6 +3066,41 @@ fn the_default_size_fits_the_main_screen_without_scrolling() {
         assert!(
             results.left() > designs.right(),
             "{monitor:?}: not side by side"
+        );
+        // With the Ask-your-AI prompt open, the whole card still shows without scrolling:
+        // the box keeps to a few lines and scrolls inside.
+        let mut h = h;
+        h.get_by_label("Ask your AI about this file")
+            .click_accesskit();
+        h.run_steps(8);
+        assert!(
+            !h.state().page_scrolls(),
+            "{monitor:?}: the open prompt makes the page scroll at {size:?}"
+        );
+        assert_main_screen_in_view(&h, size);
+        let heading = h.get_by_label("RESULTS").rect();
+        let top = h.get_by_label("Open in SolidCraft").rect();
+        assert!(
+            top.top() >= heading.bottom(),
+            "{monitor:?}: the card's top {top:?} scrolled under RESULTS {heading:?}"
+        );
+        let convert_row = h.get_by_label("Convert").rect().top();
+        for label in ["Copy", "Close"] {
+            let rect = h.get_by_label(label).rect();
+            assert!(
+                rect.bottom() <= convert_row,
+                "{monitor:?}: {label} {rect:?} below the Convert row at {convert_row}"
+            );
+        }
+        // The box's own rect is its whole text; what shows is the space between the button
+        // and the Copy row under it: the Report row, "Copied" and about five lines (uncapped,
+        // the whole prompt took about 400 px).
+        let ask = h.get_by_label("Ask your AI about this file").rect();
+        let copy = h.get_by_label("Copy").rect();
+        assert!(
+            copy.top() - ask.bottom() < 220.0,
+            "{monitor:?}: the prompt takes {} px",
+            copy.top() - ask.bottom()
         );
     }
 }

@@ -2510,19 +2510,24 @@ fn row_ui(
     }
     if let Some(message) = &view.error {
         ui.label(RichText::new(message).color(p.danger));
-        ui.horizontal_wrapped(|ui| {
-            if let Some((path, ready)) = log {
-                if let Err(message) = platform::log_controls(ui, path, ready) {
-                    action = Some(Action::Notice(message));
-                }
-            }
+        let mut diagnose = |ui: &mut egui::Ui| {
             if ui
                 .add_enabled(!running, egui::Button::new("Diagnose this file"))
                 .clicked()
             {
                 action = Some(Action::Diagnose(index));
             }
-        });
+        };
+        match log {
+            Some((path, ready)) => {
+                if let Err(message) = platform::log_controls_with(ui, path, ready, diagnose) {
+                    action = Some(Action::Notice(message));
+                }
+            }
+            None => {
+                ui.horizontal_wrapped(|ui| diagnose(ui));
+            }
+        }
         if row.output.is_some() && row.report.is_some() {
             if let Some(chosen) = ask_ai_ui(ui, index, ai) {
                 action = Some(chosen);
@@ -2555,8 +2560,9 @@ fn row_ui(
             .truncate(),
         )
         .on_hover_text(output);
-        ui.label(RichText::new(&view.outcome).color(p.ink));
-        for loss in history_info(row.report.as_ref()) {
+        let (outcome, history) = outcome_and_history(&view.outcome, row.report.as_ref());
+        ui.label(RichText::new(outcome).color(p.ink));
+        for loss in history {
             ui.label(RichText::new(loss).color(p.tide));
         }
         if let Some(summary) = &view.assembly {
@@ -2748,6 +2754,9 @@ fn ask_ai_ui(ui: &mut egui::Ui, index: usize, ai: Option<&AiPrompt>) -> Option<A
     ai_prompt_ui(ui, index, ai).or(action)
 }
 
+/// Lines of the prompt box shown at once; the rest scrolls inside it.
+const AI_PROMPT_LINES: f32 = 5.0;
+
 /// The copied prompt under the button, with "Copied" for a moment after a copy.
 fn ai_prompt_ui(ui: &mut egui::Ui, index: usize, ai: Option<&AiPrompt>) -> Option<Action> {
     let mut action = None;
@@ -2759,13 +2768,20 @@ fn ai_prompt_ui(ui: &mut egui::Ui, index: usize, ai: Option<&AiPrompt>) -> Optio
         ui.ctx().request_repaint_after(left);
     }
     let mut text = ai.text.as_str();
-    ui.add(
-        egui::TextEdit::multiline(&mut text)
-            .font(egui::TextStyle::Monospace)
-            .desired_width(f32::INFINITY)
-            .desired_rows(3)
-            .id_salt(("ask-ai-text", index)),
-    );
+    // At most about five lines tall, scrolling inside, so the card still fits the window.
+    let line = ui.text_style_height(&egui::TextStyle::Monospace);
+    ScrollArea::vertical()
+        .id_salt(("ask-ai-scroll", index))
+        .max_height(line * AI_PROMPT_LINES + 8.0)
+        .show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut text)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(3)
+                    .id_salt(("ask-ai-text", index)),
+            );
+        });
     ui.horizontal(|ui| {
         if ui.button("Copy").clicked() {
             action = Some(Action::AskAi(index));
@@ -2913,6 +2929,25 @@ fn side_by_side<R>(ui: &mut egui::Ui, wide: bool, body: impl FnOnce(&mut egui::U
     } else {
         body(ui)
     }
+}
+
+/// The outcome line and the history notes under it, saying each thing once: a design
+/// without history names why in the outcome line, not again in a note under it.
+fn outcome_and_history<'a>(outcome: &str, report: Option<&'a Value>) -> (String, Vec<&'a str>) {
+    let mut notes = history_info(report);
+    let Some(rest) = outcome.strip_prefix("Geometry without history") else {
+        return (outcome.to_owned(), notes);
+    };
+    let reason = notes
+        .iter()
+        .position(|note| note.starts_with("flattened: "))
+        .map(|at| notes.remove(at)["flattened: ".len()..].to_owned());
+    notes.retain(|note| !note.starts_with("flattened: "));
+    let outcome = match (rest.strip_prefix('.'), reason) {
+        (Some(after), Some(reason)) => format!("Geometry without history: {reason}.{after}"),
+        _ => outcome.to_owned(),
+    };
+    (outcome, notes)
 }
 
 fn history_info(report: Option<&Value>) -> Vec<&str> {
@@ -3809,6 +3844,33 @@ mod tests {
             });
         harness.run_steps(8);
         assert!(harness.query_by_label(message).is_some());
+    }
+
+    #[test]
+    fn a_design_without_history_says_why_once() {
+        let report = json!({"ok": true, "losses": [
+            {"level": "Info", "subject": "history", "message": "flattened: the design carries no feature history"},
+            {"level": "Info", "subject": "history", "message": "sketches kept as geometry"}]});
+        let (outcome, notes) = outcome_and_history("Geometry without history.", Some(&report));
+        assert_eq!(
+            outcome,
+            "Geometry without history: the design carries no feature history."
+        );
+        assert_eq!(notes, ["sketches kept as geometry"]);
+        // A reason already in the outcome line is not repeated under it.
+        let (outcome, notes) = outcome_and_history(
+            "Geometry without history (flattened: fillet is not mapped yet).",
+            Some(&report),
+        );
+        assert_eq!(
+            outcome,
+            "Geometry without history (flattened: fillet is not mapped yet)."
+        );
+        assert_eq!(notes, ["sketches kept as geometry"]);
+        // Editable history keeps its notes as they are.
+        let (outcome, notes) = outcome_and_history("Editable history; unverified.", Some(&report));
+        assert_eq!(outcome, "Editable history; unverified.");
+        assert_eq!(notes.len(), 2);
     }
 
     #[test]
