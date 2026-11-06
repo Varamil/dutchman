@@ -239,6 +239,24 @@ pub(super) fn interior_points(
     value: &Value,
     ctx: &Context,
 ) -> Result<Vec<V3>, String> {
+    points_on(feature, value, ctx, false)
+}
+
+/// Like [`interior_points`], but every face must be planar.
+pub(super) fn planar_points(
+    feature: &Value,
+    value: &Value,
+    ctx: &Context,
+) -> Result<Vec<V3>, String> {
+    points_on(feature, value, ctx, true)
+}
+
+fn points_on(
+    feature: &Value,
+    value: &Value,
+    ctx: &Context,
+    planar_only: bool,
+) -> Result<Vec<V3>, String> {
     let state = value.get("state").cloned().unwrap_or(Value::Null);
     let ids = value
         .get("faces")
@@ -252,7 +270,7 @@ pub(super) fn interior_points(
         let [face] = faces.as_slice() else {
             return Err(BAD.to_owned());
         };
-        points.push(point_in(face)?);
+        points.push(point_in(face, planar_only)?);
     }
     Ok(points)
 }
@@ -289,7 +307,7 @@ fn samples(face: &Boundary) -> Vec<V3> {
 }
 
 /// A point on one face: planar when its boundary is flat, else the cylinder it is part of.
-fn point_in(face: &Boundary) -> Result<V3, String> {
+fn point_in(face: &Boundary, planar_only: bool) -> Result<V3, String> {
     let samples: Vec<V3> = face
         .edges
         .iter()
@@ -304,6 +322,7 @@ fn point_in(face: &Boundary) -> Result<V3, String> {
         .collect();
     match plane(std::slice::from_ref(face), &samples) {
         Ok((origin, normal)) => planar_point(face, origin, normal),
+        Err(_) if planar_only => Err("a face that is not planar cannot be moved yet".to_owned()),
         Err(_) => cylinder_point(face),
     }
 }
@@ -1151,7 +1170,7 @@ mod tests {
             line(quarter),
         ];
         let edges: Vec<Edge> = rows.iter().map(|r| edge(r).unwrap()).collect();
-        let p = point_in(&Boundary { edges, area: 1.0 }).unwrap();
+        let p = point_in(&Boundary { edges, area: 1.0 }, false).unwrap();
         let half = quarter / 2.0;
         assert!((p[0] - 5.0 * half.cos()).abs() < 1e-6, "{p:?}");
         assert!((p[1] - 5.0 * half.sin()).abs() < 1e-6, "{p:?}");
@@ -1173,7 +1192,7 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        let p = point_in(&Boundary { edges, area: 100.0 }).unwrap();
+        let p = point_in(&Boundary { edges, area: 100.0 }, false).unwrap();
         assert!(
             p[0] > 1.0 && p[0] < 9.0 && p[1] > 1.0 && p[1] < 9.0,
             "{p:?}"
