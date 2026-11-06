@@ -107,6 +107,8 @@ pub struct App {
     /// The SolidCraft CLI that checks histories when nothing else is chosen, if one is found.
     checker: Result<PathBuf, dutchman_solidcraft::NoCli>,
     solidcraft_open: bool,
+    /// Where the search for `solidcraft-cli` looked, when it found none.
+    search_note: String,
     /// Where the header ends, so its windows open below its controls.
     header_bottom: f32,
     /// Why the file last chosen as the `solidcraft-cli` cannot be used.
@@ -267,6 +269,43 @@ fn found_solidcraft(
     (found, detected)
 }
 
+/// Where the search for `solidcraft-cli` looked and what it found, in plain words, when no
+/// release was found; empty otherwise.
+fn search_note(checking: &dutchman_solidcraft::Verification, found: Option<&str>) -> String {
+    if found.is_some() || *checking != dutchman_solidcraft::Verification::Auto {
+        return String::new();
+    }
+    places_note(&dutchman_solidcraft::search_report(checking, false))
+}
+
+/// The "Looked in" text for a search report.
+fn places_note(report: &Value) -> String {
+    let places = report["places"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|place| {
+            let outcome = match place["outcome"].as_str() {
+                Some("unset") => "not set",
+                Some("set_but_missing") => "set, but the file is missing",
+                Some("not_found") => "not found",
+                _ => "found",
+            };
+            format!(
+                "• {}: {outcome}",
+                place["place"].as_str().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    // One place per line, so the list reads at a glance.
+    format!(
+        "Looked in:\n{places}\nTo use another copy, choose it below or set the {} environment \
+         variable to its full path.",
+        dutchman_solidcraft::CLI_ENV
+    )
+}
+
 fn saved_choices(options: &ConvertOptions, custom: bool) -> Value {
     serde_json::json!({
         "preset": options.preset.name(), "custom": custom,
@@ -313,8 +352,14 @@ impl App {
             .and_then(Value::as_str)
             .map(PathBuf::from)
             .filter(|cli| cli.is_file());
+        // A remembered file that no longer answers as a SolidCraft CLI (an uninstalled or
+        // replaced copy) must not hide the one the automatic search finds.
+        let chosen_cli = chosen_cli.filter(|cli| {
+            dutchman_solidcraft::solidcraft_version(&checking_with(Some(cli))).is_some()
+        });
         let checking_with = checking_with(chosen_cli.as_ref());
         let (found_version, detected_version) = found_solidcraft(&checking_with);
+        let search_note = search_note(&checking_with, found_version.as_deref());
         let mut options = ConvertOptions {
             solidcraft: chosen_cli,
             solidcraft_version: Some(detected_version),
@@ -358,6 +403,7 @@ impl App {
             has_app: platform::has_solidcraft_app(),
             checker: dutchman_solidcraft::usable_cli(&checking_with),
             solidcraft_open: false,
+            search_note,
             header_bottom: 72.0,
             solidcraft_cli_error: None,
             found_version,
@@ -412,6 +458,19 @@ impl App {
         self.options.solidcraft_version = Some(self.detected_version);
     }
 
+    /// Supplies a search that found nothing, with these `(place, outcome)` pairs (outcomes as in
+    /// the search report), for UI previews.
+    #[cfg(feature = "test-support")]
+    pub fn preview_search_for_test(&mut self, places: &[(&str, &str)]) {
+        let places: Vec<Value> = places
+            .iter()
+            .map(|(place, outcome)| serde_json::json!({"place": place, "outcome": outcome}))
+            .collect();
+        self.checker = Err(dutchman_solidcraft::NoCli::NotFound("Not found".into()));
+        self.found_version = None;
+        self.search_note = places_note(&serde_json::json!({"places": places}));
+    }
+
     /// Shows the notice for a run that didn't finish, with its log at `path`, for UI previews.
     pub fn preview_unfinished_run(&mut self, path: PathBuf) {
         self.unfinished_diagnostic = Some(path);
@@ -434,6 +493,7 @@ impl App {
             self.options.solidcraft_version = Some(self.detected_version);
         }
         self.solidcraft_cli_error = None;
+        self.search_note = search_note(&checking, self.found_version.as_deref());
     }
 
     /// Takes the file a person chose as the `solidcraft-cli`, or says why it cannot be used.
@@ -1685,6 +1745,10 @@ impl App {
             .clicked()
         {
             self.solidcraft_open = !self.solidcraft_open;
+            if self.solidcraft_open && self.found_version.is_none() {
+                // Search again: SolidCraft may have been installed, or been slow to start.
+                self.set_solidcraft_cli(self.options.solidcraft.clone());
+            }
         }
     }
 
@@ -1710,6 +1774,9 @@ impl App {
                     if let Some(minor) = dutchman_solidcraft::solidcraft_minor(found) {
                         ui.label(format!("SolidCraft {minor} is installed."));
                     }
+                }
+                if !self.search_note.is_empty() {
+                    ui.label(&self.search_note);
                 }
                 self.solidcraft_picker(ui);
                 self.solidcraft_cli_chooser(ui, ctx);
