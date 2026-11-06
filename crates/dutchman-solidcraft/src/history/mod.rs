@@ -124,6 +124,8 @@ enum Mapped {
     Nothing,
     /// This SolidCraft feature.
     Feature(Value),
+    /// Written with an earlier feature (an attached plate's bend).
+    Consumed,
 }
 
 impl History {
@@ -466,6 +468,8 @@ struct Context<'a> {
     looks: BTreeMap<String, Value>,
     /// The timeline name each mapped source feature took, by CADIR feature id.
     feature_names: BTreeMap<String, String>,
+    /// Source ids of bends written with their attached plate.
+    consumed_bends: std::collections::BTreeSet<String>,
     /// All features making a composite pattern's instance set, including its seeds.
     pattern_features: BTreeMap<String, Vec<String>>,
     pattern_replay_required: bool,
@@ -515,6 +519,7 @@ impl<'a> Context<'a> {
             spatial: BTreeMap::new(),
             looks: BTreeMap::new(),
             feature_names: BTreeMap::new(),
+            consumed_bends: std::collections::BTreeSet::new(),
             pattern_features: BTreeMap::new(),
             pattern_replay_required: false,
             named_bodies: Vec::new(),
@@ -869,6 +874,13 @@ fn map_into(
             Ok(Mapped::Nothing) => {
                 history.mapped += 1;
                 out.push(outcome(FeatureStatus::NotNeeded, None));
+            }
+            Ok(Mapped::Consumed) => {
+                history.mapped += 1;
+                out.push(outcome(
+                    FeatureStatus::NotNeeded,
+                    Some("mapped with its plate".to_owned()),
+                ));
             }
             Ok(Mapped::Feature(mut mapped)) => {
                 history.mapped += 1;
@@ -1368,6 +1380,18 @@ fn map_feature(
             sheet::edge_flange(feature, definition, ctx, preceding).map(Mapped::Feature)
         }
         Some("sheet_metal_hem") => Err(sheet::hem_refusal(definition)),
+        Some("sheet_metal_attached_plate") => {
+            sheet::attached_plate(feature, definition, ctx, preceding).map(Mapped::Feature)
+        }
+        Some("sheet_metal_bend")
+            if feature
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| ctx.consumed_bends.contains(id)) =>
+        {
+            Ok(Mapped::Consumed)
+        }
+        Some("sheet_metal_bend") => Err(sheet::bend_refusal()),
         Some("stored_geometry") => base::stored(feature, ctx, report).map(Mapped::Feature),
         Some("base_feature") if base::holds_none(definition) => Ok(Mapped::Nothing),
         Some("base_feature") => base::map(feature, definition, ctx).map(Mapped::Feature),
@@ -1868,7 +1892,7 @@ mod tests {
         });
         match map_feature(&stored, &mut ctx, &mut Report::default(), &mut Vec::new())? {
             Mapped::Feature(mapped) => Ok(mapped),
-            Mapped::Nothing => Err("mapped to nothing".to_owned()),
+            Mapped::Nothing | Mapped::Consumed => Err("mapped to nothing".to_owned()),
         }
     }
 
