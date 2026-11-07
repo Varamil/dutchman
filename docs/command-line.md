@@ -174,6 +174,7 @@ the stage and elapsed time. The bar measures reading designs, not the remaining 
 Stage ids are `input` (opening the input and finding part files), `decode` (reading geometry and history), `project`
 (checking the decoded model), `map` (building and checking the output design), and `write`
 (saving the output). A model-check fallback can return to `decode` to read geometry alone.
+The fallback keeps geometry and assembly structure, and drops history, sketches, parameters and what named them.
 A heartbeat confirms the worker is running; it does not measure decoder activity.
 
 Fusion `.f3z` archives are decoded in one call. Member decode attempts can repeat, so
