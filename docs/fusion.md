@@ -145,6 +145,13 @@ Bounds checks use conservative geometry envelopes. Unsupported or missing bounds
 first placement, as do unsupported touching joints and ambiguous pose carriers. Rejections
 are deterministic. Joints then work from the selected placements as before.
 
+The report names the parts whose position nothing confirms. A part whose placement could not be
+read sits at its design's origin, and the sentence always shown on the result card says so,
+naming the first few, with all of them in a warning below. A part with only a
+stored pose and no joint, or with a later pose that was not used, is named in a note, because
+those positions are usually right: when one looks misplaced, it's the place to look. The full list is
+`part_positions.assumed` in the [JSON report](json.md).
+
 **As Fusion last showed them** prefers the displayed-pose source, then uses current poses
 where available without Smart's checks, and first placements otherwise. Until displayed
 poses are bound by the decoder, this option relies on current poses, which can be stale.
