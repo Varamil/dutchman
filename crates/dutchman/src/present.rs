@@ -585,6 +585,10 @@ pub fn outcome(report: &Value) -> String {
         text.push(' ');
         text.push_str(&note);
     }
+    if let Some(note) = body_note(report) {
+        text.push(' ');
+        text.push_str(&note);
+    }
     if let Some(note) = identity_note(report) {
         text.push(' ');
         text.push_str(&note);
@@ -614,6 +618,50 @@ fn region_note(report: &Value) -> Option<String> {
              the source."
         )),
     }
+}
+
+/// The partial histories whose replay doesn't hold the bodies the source stores where the
+/// history stops (`history/body-mismatch`). The imported final shape is still right, but the
+/// rebuilt features are not the source's, so the card says so, and what to do, rather than
+/// leave it to the JSON report.
+fn body_note(report: &Value) -> Option<String> {
+    const ADVICE: &str =
+        "The final shape is correct; check the rebuilt features before editing them.";
+    let found: Vec<&str> = report
+        .get("losses")?
+        .as_array()?
+        .iter()
+        .filter(|loss| loss.get("code").and_then(Value::as_str) == Some("history/body-mismatch"))
+        .map(|loss| loss.get("message").and_then(Value::as_str).unwrap_or(""))
+        .collect();
+    match found.as_slice() {
+        [] => None,
+        [why] => Some(match body_difference(why) {
+            Some(short) => format!(
+                "The rebuilt features don't match the original where the history stops ({short}). {ADVICE}"
+            ),
+            None => format!(
+                "The rebuilt features don't match the original where the history stops. {ADVICE}"
+            ),
+        }),
+        all => Some(format!(
+            "In {} parts, the rebuilt features don't match the original where the history stops. {ADVICE}",
+            all.len()
+        )),
+    }
+}
+
+/// A body-mismatch message in a few plain words: "0 bodies where it has 1", or "a rebuilt
+/// body is 12.6 mm from where it has it". `None` for a message of another form.
+fn body_difference(message: &str) -> Option<String> {
+    if let Some(rest) = message.strip_prefix("the retained features give ") {
+        let (rebuilt, source) = rest.split_once(" where the source has ")?;
+        let count = source.split_whitespace().next()?;
+        return Some(format!("{rebuilt} where it has {count}"));
+    }
+    let rest = message.strip_prefix("a retained body sits ")?;
+    let distance = rest.strip_suffix(" from where the source has it at the same point")?;
+    Some(format!("a rebuilt body is {distance} from where it has it"))
 }
 
 /// The parts at their design's origin because their placement could not be read. Among
@@ -717,6 +765,33 @@ pub fn loss_counts(losses: &[&Value]) -> String {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_card_says_when_rebuilt_features_do_not_match_the_source() {
+        let report = |messages: &[&str]| {
+            let losses: Vec<Value> = messages
+                .iter()
+                .map(|message| {
+                    serde_json::json!({"code": "history/body-mismatch", "level": "Degraded",
+                        "message": message})
+                })
+                .chain([serde_json::json!({"code": "f3d/other", "message": "unrelated"})])
+                .collect();
+            serde_json::json!({"ok": true, "mode": "partial_history",
+                "history": {"rebuilt": 3, "needing": 4}, "losses": losses})
+        };
+        let advice = "The final shape is correct; check the rebuilt features before editing them.";
+        assert!(!outcome(&report(&[])).contains("don't match"));
+        assert!(outcome(&report(&["the retained features give 0 bodies where the source has 1 body at the same point"]))
+            .ends_with(&format!("The rebuilt features don't match the original where the history stops (0 bodies where it has 1). {advice}")));
+        assert!(outcome(&report(&["a retained body sits 12.6 mm from where the source has it at the same point"]))
+            .ends_with(&format!("The rebuilt features don't match the original where the history stops (a rebuilt body is 12.6 mm from where it has it). {advice}")));
+        assert!(outcome(&report(&["something else"])).ends_with(&format!(
+            "The rebuilt features don't match the original where the history stops. {advice}"
+        )));
+        assert!(outcome(&report(&["a", "b"]))
+            .ends_with(&format!("In 2 parts, the rebuilt features don't match the original where the history stops. {advice}")));
+    }
 
     #[test]
     fn the_card_counts_extrudes_whose_region_was_not_checked() {
