@@ -6,8 +6,8 @@
 //! decoder that does not know which curves are construction (cadmpeg's Inventor decoder, for
 //! now) leaves such a line solid; SolidCraft then finds the region split and no profile it can
 //! match. Such lines are construction, and are written so.
-//! Explicit whole-loop region consumers also identify unused layout lines, provided no other
-//! consumer needs those lines as profile geometry.
+//! When every consumer of a sketch selects regions (whole loops or trimmed), a curve that bounds
+//! none of the selected regions is construction too, provided no consumer names it.
 //!
 //! When a source loop itself follows crossing curves, keep those curves solid and split
 //! their straight-line arrangement for region selection. Sampling is used only for
@@ -84,6 +84,83 @@ pub(super) fn crossing(sketch: &Value, entities: &[&Value]) -> BTreeSet<String> 
         .collect()
 }
 
+/// The solid source curves of a sketch that are written as construction, by reason.
+pub(super) struct Demoted {
+    /// Lines across a region the sketch's profile table takes whole, and unused lines across
+    /// selected circles.
+    pub crossing: BTreeSet<String>,
+    /// Curves that bound no region a feature selects ([`stray_curves`]).
+    pub stray: BTreeSet<String>,
+}
+
+/// Which of the sketch's solid curves are written as construction. A trimmed region is
+/// bounded by pieces of its curves: SolidCraft finds it only when they stay solid and split
+/// the sketch there, so those never are.
+pub(super) fn demoted(sketch: &Value, entities: &[&Value], features: &[Value]) -> Demoted {
+    let mut crossing = crossing(sketch, entities);
+    crossing.extend(region_lines(sketch, entities, features));
+    let mut stray = stray_curves(sketch, entities, features);
+    let trimmed = trimmed_region_curves(sketch, features);
+    crossing.retain(|id| !trimmed.contains(id));
+    stray.retain(|id| !trimmed.contains(id));
+    Demoted { crossing, stray }
+}
+
+/// Whether a line of `members` (a profile loop) runs along part of another solid line of the
+/// sketch, one that is not construction in the source nor in `demoted`. SolidCraft splits
+/// both where they overlap, so the loop's own curves no longer bound one of its profiles.
+pub(super) fn shares_an_edge(
+    members: &[Value],
+    entities: &[&Value],
+    demoted: &BTreeSet<String>,
+) -> bool {
+    let ends = |entity: &Value| -> Option<(P2, P2)> {
+        let geometry = entity.get("geometry")?;
+        if geometry.get("kind").and_then(Value::as_str) != Some("line") {
+            return None;
+        }
+        Some((
+            super::sketch::p2(geometry.get("start"))?,
+            super::sketch::p2(geometry.get("end"))?,
+        ))
+    };
+    let own: BTreeSet<&str> = members
+        .iter()
+        .filter_map(|member| member.get("entity").and_then(Value::as_str))
+        .collect();
+    let others: Vec<(P2, P2)> = entities
+        .iter()
+        .filter(|entity| entity.get("construction").and_then(Value::as_bool) != Some(true))
+        .filter(|entity| {
+            entity
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !own.contains(id) && !demoted.contains(id))
+        })
+        .filter_map(|entity| ends(entity))
+        .collect();
+    own.iter()
+        .filter_map(|id| entity_named(entities, id))
+        .filter_map(ends)
+        .any(|(a, b)| {
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let length = dx.hypot(dy);
+            if length <= EPS || !length.is_finite() {
+                return false;
+            }
+            let tol = (length * 1e-6).max(1e-9);
+            let off = |p: P2| ((p[0] - a[0]) * dy - (p[1] - a[1]) * dx).abs() / length;
+            let along = |p: P2| ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / length;
+            others.iter().any(|&(c, d)| {
+                if off(c) > tol || off(d) > tol {
+                    return false;
+                }
+                let (low, high) = (along(c).min(along(d)), along(c).max(along(d)));
+                high.min(length) - low.max(0.0) > tol
+            })
+        })
+}
+
 /// The source curves that bound a trimmed profile region some feature selects from `sketch`.
 pub(super) fn trimmed_region_curves(sketch: &Value, features: &[Value]) -> BTreeSet<String> {
     fn walk(value: &Value, sketch: &str, found: &mut BTreeSet<String>, depth: usize) {
@@ -149,7 +226,11 @@ pub(super) fn trimmed_region_curves(sketch: &Value, features: &[Value]) -> BTree
 /// The curves that the sketch's consumers (every feature naming it) select whole-loop regions
 /// from, when every consumer is such a selection: the source entities of the selected loops.
 /// `None` when some consumer needs the sketch's curves as geometry, or nothing selects a region.
-fn whole_loop_uses(sketch: &Value, features: &[Value]) -> Option<BTreeSet<String>> {
+fn whole_loop_uses(
+    sketch: &Value,
+    entities: &[&Value],
+    features: &[Value],
+) -> Option<BTreeSet<String>> {
     let id = sketch.get("id").and_then(Value::as_str)?;
     let mut identities = vec![id];
     identities.extend(features.iter().filter_map(|feature| {
@@ -171,7 +252,7 @@ fn whole_loop_uses(sketch: &Value, features: &[Value]) -> Option<BTreeSet<String
         if definition.get("definition").and_then(Value::as_str) == Some("sketch") {
             continue;
         }
-        let found = region_uses(definition, id, &identities, sketch, &mut used, 0)?;
+        let found = region_uses(definition, id, &identities, sketch, entities, &mut used, 0)?;
         if !found
             && feature
                 .get("dependencies")
@@ -190,22 +271,20 @@ fn whole_loop_uses(sketch: &Value, features: &[Value]) -> Option<BTreeSet<String
     selected.then_some(used)
 }
 
-/// Curves no closed loop of the sketch's profile table uses, when every consumer of the sketch
-/// selects whole-loop regions and none of them names the curve. They bound no region, so
-/// solid they only divide the regions that are selected; they are construction.
+/// Curves that bound no region a feature selects from the sketch, when every consumer of the
+/// sketch selects regions (whole loops or trimmed) and none of them names the curve. Solid,
+/// they only divide the regions that are selected: a loop no feature takes, sharing part of an
+/// edge with one that is taken, or a ring around a hole the region keeps, leaves SolidCraft no
+/// profile with the source's boundary. They are construction.
 pub(super) fn stray_curves(
     sketch: &Value,
     entities: &[&Value],
     features: &[Value],
 ) -> BTreeSet<String> {
-    let in_loops: BTreeSet<&str> = loops(sketch)
-        .into_iter()
-        .flatten()
-        .filter_map(|member| member.get("entity").and_then(Value::as_str))
-        .collect();
-    if in_loops.is_empty() || whole_loop_uses(sketch, features).is_none() {
+    let Some(used) = whole_loop_uses(sketch, entities, features).filter(|used| !used.is_empty())
+    else {
         return BTreeSet::new();
-    }
+    };
     let strays: BTreeSet<String> = entities
         .iter()
         .filter(|entity| entity.get("construction").and_then(Value::as_bool) != Some(true))
@@ -216,7 +295,7 @@ pub(super) fn stray_curves(
             )
         })
         .filter_map(|entity| entity.get("id").and_then(Value::as_str))
-        .filter(|id| !in_loops.contains(id))
+        .filter(|id| !used.contains(*id))
         .map(str::to_owned)
         .collect();
     if strays.is_empty() {
@@ -263,7 +342,7 @@ pub(super) fn region_lines(
     entities: &[&Value],
     features: &[Value],
 ) -> BTreeSet<String> {
-    let Some(used) = whole_loop_uses(sketch, features) else {
+    let Some(used) = whole_loop_uses(sketch, entities, features) else {
         return BTreeSet::new();
     };
     if entities.len() > MAX_EDGES {
@@ -335,6 +414,7 @@ fn region_uses(
     id: &str,
     identities: &[&str],
     sketch: &Value,
+    entities: &[&Value],
     used: &mut BTreeSet<String>,
     depth: usize,
 ) -> Option<bool> {
@@ -351,8 +431,35 @@ fn region_uses(
         let profiles = sketch.get("profiles")?.as_array()?;
         let mut members = 0usize;
         for region in regions {
-            if region.get("region").and_then(Value::as_str) != Some("loops") {
-                return None;
+            match region.get("region").and_then(Value::as_str) {
+                Some("loops") => {}
+                // A trimmed region is bounded by pieces of its curves: each is used.
+                Some("trimmed") => {
+                    let holes = match region.get("hole_boundaries") {
+                        Some(holes) => holes.as_array()?.as_slice(),
+                        None => &[],
+                    };
+                    let rings = std::iter::once(region.get("outer_boundary")?).chain(holes);
+                    for ring in rings {
+                        let ring = ring.as_array()?;
+                        // A boundary that doesn't close leaves the curves finishing it unknown.
+                        if ring.is_empty() || trimmed_ring(ring, entities).is_none() {
+                            return None;
+                        }
+                        members = members.checked_add(ring.len())?;
+                        if members > MAX_EDGES {
+                            return None;
+                        }
+                        for piece in ring {
+                            used.insert(piece.get("entity")?.as_str()?.to_owned());
+                            if used.len() > MAX_EDGES {
+                                return None;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                _ => return None,
             }
             let holes = match region.get("holes") {
                 Some(holes) => Some(holes.as_array()?),
@@ -384,10 +491,10 @@ fn region_uses(
     match value {
         Value::String(s) if identities.contains(&s.as_str()) => None,
         Value::Array(values) => values.iter().try_fold(false, |found, value| {
-            Some(region_uses(value, id, identities, sketch, used, depth + 1)? || found)
+            Some(region_uses(value, id, identities, sketch, entities, used, depth + 1)? || found)
         }),
         Value::Object(fields) => fields.values().try_fold(false, |found, value| {
-            Some(region_uses(value, id, identities, sketch, used, depth + 1)? || found)
+            Some(region_uses(value, id, identities, sketch, entities, used, depth + 1)? || found)
         }),
         _ => Some(false),
     }
@@ -1638,5 +1745,78 @@ mod tests {
         let refs: Vec<&Value> = entities.iter().collect();
         let sketch = json!({"profiles": [[member("c")]]});
         assert_eq!(crossing(&sketch, &refs).len(), 1);
+    }
+
+    /// A square loop (a to d) and a tab loop beside it (t1 to t4), with a line (x) in no loop.
+    fn square_and_tab() -> (Value, Vec<Value>) {
+        let sketch = json!({"id": "s", "profiles": [
+            pieces_loop(&["a", "b", "c", "d"]), pieces_loop(&["t1", "t2", "t3", "t4"])]});
+        let entities = vec![
+            line("a", [0.0, 0.0], [10.0, 0.0]),
+            line("b", [10.0, 0.0], [10.0, 10.0]),
+            line("c", [10.0, 10.0], [0.0, 10.0]),
+            line("d", [0.0, 10.0], [0.0, 0.0]),
+            line("t1", [10.0, 3.0], [14.0, 3.0]),
+            line("t2", [14.0, 3.0], [14.0, 7.0]),
+            line("t3", [14.0, 7.0], [10.0, 7.0]),
+            line("t4", [10.0, 7.0], [10.0, 3.0]),
+            line("x", [5.0, 5.0], [12.0, 5.0]),
+        ];
+        (sketch, entities)
+    }
+
+    fn extrude(regions: Value) -> Value {
+        json!({"id": "e", "definition": {"definition": "extrude", "profile": {
+            "kind": "sketch_regions", "value": {"sketch": "s", "regions": regions}}}})
+    }
+
+    fn strays(sketch: &Value, entities: &[Value], features: &[Value]) -> Vec<String> {
+        let refs: Vec<&Value> = entities.iter().collect();
+        stray_curves(sketch, &refs, features).into_iter().collect()
+    }
+
+    #[test]
+    fn a_loop_no_feature_takes_is_construction_with_the_curves_in_no_loop() {
+        let (sketch, entities) = square_and_tab();
+        let features = [extrude(json!([{"region": "loops", "outer": 0}]))];
+        assert_eq!(
+            strays(&sketch, &entities, &features),
+            ["t1", "t2", "t3", "t4", "x"]
+        );
+        // Both loops taken: only the line in no loop.
+        let features = [extrude(
+            json!([{"region": "loops", "outer": 0}, {"region": "loops", "outer": 1}]),
+        )];
+        assert_eq!(strays(&sketch, &entities, &features), ["x"]);
+    }
+
+    #[test]
+    fn the_curves_of_a_trimmed_region_taken_stay_solid() {
+        let (sketch, entities) = square_and_tab();
+        // Line ranges are distances along the line: the tab's three outer sides whole, and
+        // the stretch of the square's side between them.
+        let trimmed = json!({"region": "trimmed", "outer_boundary": [
+            {"entity": "t1", "parameter_range": [0.0, 4.0]},
+            {"entity": "t2", "parameter_range": [0.0, 4.0]},
+            {"entity": "t3", "parameter_range": [0.0, 4.0]},
+            {"entity": "b", "parameter_range": [3.0, 7.0]}]});
+        let features = [
+            extrude(json!([{"region": "loops", "outer": 0}])),
+            extrude(json!([trimmed])),
+        ];
+        assert_eq!(strays(&sketch, &entities, &features), ["t4", "x"]);
+        // A trimmed region with no boundary, or one that doesn't close (the curves finishing
+        // it are not named), says nothing about which curves it needs.
+        for boundary in [
+            json!([]),
+            json!([{"entity": "t1", "parameter_range": [0.0, 4.0]},
+                   {"entity": "t2", "parameter_range": [0.0, 4.0]}]),
+        ] {
+            let features = [
+                extrude(json!([{"region": "loops", "outer": 0}])),
+                extrude(json!([{"region": "trimmed", "outer_boundary": boundary}])),
+            ];
+            assert!(strays(&sketch, &entities, &features).is_empty());
+        }
     }
 }
