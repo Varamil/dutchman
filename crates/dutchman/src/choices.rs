@@ -695,6 +695,38 @@ const COEFFICIENTS: &[Coefficients] = &[
         time_band: None,
     },
     Coefficients {
+        format: Format::EdrawingsPart,
+        model: CostModel::Legacy(LegacyCost {
+            base_bytes: 100_000_000,
+            bytes_per_byte: 30.0,
+            base_seconds: 1.0,
+            seconds_per_mib: 2.0,
+            history_factor: 3.0,
+            history_seconds_factor: 3.0,
+            startup: None,
+            check_share: 1.1,
+        }),
+        band: 1.0,
+        memory_band: 1.0,
+        time_band: None,
+    },
+    Coefficients {
+        format: Format::EdrawingsAssembly,
+        model: CostModel::Legacy(LegacyCost {
+            base_bytes: 100_000_000,
+            bytes_per_byte: 30.0,
+            base_seconds: 1.0,
+            seconds_per_mib: 2.0,
+            history_factor: 3.0,
+            history_seconds_factor: 3.0,
+            startup: None,
+            check_share: 1.1,
+        }),
+        band: 1.0,
+        memory_band: 1.0,
+        time_band: None,
+    },
+    Coefficients {
         format: Format::Rhino,
         model: CostModel::Legacy(LegacyCost {
             base_bytes: 100_000_000,

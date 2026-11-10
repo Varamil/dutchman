@@ -132,6 +132,8 @@ that face's area (within 1 mm² or 3%, which absorbs arcs measured as fine polyg
 there. An extrude whose region cannot be checked this way stays kept and is marked
 `profile_unverified` in the JSON report (see [json.md](json.md)).
 
+eDrawings parts (`.eprt`) and assemblies (`.easm`) convert as flat-faceted solids rebuilt from the file's display mesh, with no feature history. An `.easm` holds all its parts, so it needs no other files; its placements and names convert. See [eDrawings](edrawings.md).
+
 History checks stay on by default and fit themselves to free memory. If a second build
 will not fit after reading the design, conversion still saves a usable original shape
 with retained history unverified; the card and report say
