@@ -1,2 +1,6 @@
 ### Formats
-- Convert eDrawings parts (`.eprt`) and assemblies (`.easm`) through cadmpeg's new `edrawings` codec. The files carry a display mesh, so geometry converts as flat-faceted solids rebuilt from it: no exact curved surfaces and no feature history. An `.easm` holds all its parts in one file and converts with its placements, names and sub-assemblies. See [eDrawings](docs/edrawings.md). It reads files that SolidWorks wrote directly as well as files saved again by the eDrawings viewer, including sub-assemblies at any depth, parts of several bodies, hidden parts and mesh gaps that are closed before the solid is built. Colours set on a part or in a display state are dropped, and the report says so. It reads model stream versions 18.00, 19.00 and 19.10, including files with hole markers, cosmetic threads and names stored as wide characters.
+
+- eDrawings parts (`.eprt`) and assemblies (`.easm`) convert as flat-faceted solids, rebuilt
+  from the file's display mesh. See [eDrawings](docs/edrawings.md).
+- An `.easm` needs no other files: it keeps its placements, names, and sub-assemblies.
+- eDrawings files carry no exact curved surfaces and no feature history, so neither converts.

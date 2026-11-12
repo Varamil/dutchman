@@ -24,7 +24,7 @@ exact geometry exists in the file for Dutchman or cadmpeg to recover.
 | A mesh that does not close. | A sheet body, with a loss note saying so. |
 | Curved surfaces (cylinders, spheres, fillets). | Many small flat faces. The shape is close, but faces are not exact curved surfaces, so SolidCraft cannot select a cylinder as one face or edit its radius. |
 | A mesh with small gaps or cracks, or with a point that sits on the edge of a neighbouring patch. | Closed before the body is built, so the body can still be a solid. |
-| Colours, per body. | Carried as the body's appearance. |
+| Colours, per body. | Carried as a plain body colour in the STEP. No appearance is written: no name, material or opacity. |
 | Several colours on one body. | Reduced to the body colour. The report counts the faces affected. |
 | Feature history, sketches, parameters. | None exist in the file. The part converts without history. |
 
@@ -59,8 +59,9 @@ single-file design, and the components it places are built from that one decode.
    and tiny loose slivers. Faces with no area are removed and their neighbours joined.
    The report counts them as a loss. Pieces that were inside out are turned the right way
    round, and the report says so. Closed cavities inside a body are kept.
-6. **Colour overrides dropped.** A colour set on a part or in a display state, rather than on
-   the body, is dropped; the body keeps its own colour. The report counts these.
+6. **Colours only, no appearances.** Each body keeps one plain colour. No appearance entry
+   (name, material, opacity) is written. A colour set on a part or in a display state, rather
+   than on the body, is dropped; the body keeps its own colour. The report counts these.
 7. **No history.** Features, sketches, dimensions and parameters are not in the file, so
    no feature history is written. See [Feature history](history.md) for what other formats
    can map.
