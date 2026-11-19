@@ -1,5 +1,9 @@
 # The anonymous report: `dutchman.report-anon/1`
 
+When filing an issue, copy `versions` verbatim, including `versions.dutchman`. See
+[Report what you found](testing-your-library.md#5-report-what-you-found) for the required
+Dutchman, SolidCraft, and source program versions and the optional steps after reporting.
+
 `dutchman convert-all --report-anon FILE …`, `dutchman convert --report-anon FILE …` for one
 file (the report of a batch of one, with `--report-salt` and `--report-key` as for
 `convert-all`, and the same stderr notice with the salt), or the MCP `convert_all` tool's
@@ -21,12 +25,11 @@ you choose whether to attach it. The log has no names or contents from the desig
 ## Converted files with a wrong result
 
 Converted files are included in this report as well as failures. The desktop's
-**Something wrong? Report this file** section offers anonymous review and private-send
-steps for every converted result that has a saved report, whatever it lost: history not kept
-or only partly kept, features flattened or blocked, parts left unplaced, or colours dropped,
-at any loss level. The card has a visible **Report this file…** button that opens the section;
-the section itself starts closed. Only an assembly whose part files were not found
-is offered the missing-parts search instead.
+**Is there a problem? Is something missing?** panel, always open at the bottom left, offers
+the private Discord steps and, under **More**, the anonymous review for every result that has
+a saved report, whether it lost anything or not. Every finished card has a **Report this
+file…** button that chooses its file in the panel. An assembly whose part files were not found
+is offered the missing-parts search, and the panel still asks about it.
 The separate endpoint summary envelope (`dutchman.report-send/1`) supports only bounded
 metadata and sharing choices; it has no free-text description field. The review displays
 that exact envelope. Converted-file summaries use `converted-with-problem` as their
@@ -140,3 +143,15 @@ The exact codes above are allow-listed; arbitrary `dutchman/appearance.*` string
 accepted as categories. Assignments kept as body colours, uniform face colours or individual
 face colours are not counted as dropped. Multiple dropped assignments count individually,
 even when they share a target. Ordinary conversion reports retain their human explanations.
+
+
+## Counts-only anonymous reports
+
+Use `--report-counts --report-anon FILE` with `convert` or `convert-all` to write
+`dutchman.report-counts/1`. For MCP `convert_all`, set `report_counts: true` and
+`report_anon` to the destination. This opt-in profile holds counts and fixed categories;
+it has no messages, file IDs, names, paths, dimensions or geometry. It cannot use
+`report_salt` or `report_key`. Source version bands remain `unknown` when unavailable.
+Review the exact file before sharing. This option writes locally and does not authorize
+sending; retain the existing user confirmation before sharing a report.
+See the counts-only schema in [JSON reports](json.md).

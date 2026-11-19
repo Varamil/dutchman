@@ -200,6 +200,11 @@ fn decode_unguarded(
     drop(reading);
     let decoded = decoded.map_err(|err| decode_failure(format, err))?;
     let (mut ir, decode_report, fidelity) = decoded.into_parts();
+    if let Some(error) =
+        mesh_only_error(format, &ir, decode_report.geometry_transferred()).filter(|_| !drawings)
+    {
+        return Err(error);
+    }
     // An assembly's geometry is in its parts' files, read afterwards.
     if !drawings
         && !decode_report.geometry_transferred()
@@ -235,6 +240,7 @@ fn decode_unguarded(
         with_fallback(&mut ir, report, &policy, bytes.len() as u64)
     };
     drop_removed_bodies(&mut ir, report);
+    drop_inactive_configuration_bodies(&mut ir, report);
 
     let model = Model {
         ir,
@@ -253,6 +259,76 @@ fn decode_unguarded(
     }
     checked?;
     Ok(model)
+}
+
+/// Count mesh bodies from decoded tessellations and typed mesh selections with known members.
+/// An unresolved import or an undecoded-container loss alone does not establish how many mesh
+/// bodies exist.
+fn mesh_only_error(
+    format: Format,
+    ir: &cadmpeg_ir::CadIr,
+    geometry_transferred: bool,
+) -> Option<Error> {
+    use cadmpeg_ir::features::mesh::MeshSelection;
+    use cadmpeg_ir::FeatureOperation;
+    use std::collections::BTreeSet;
+
+    if !matches!(format, Format::FusionArchive | Format::FusionMultiDocument)
+        || !ir.geometry.bodies.is_empty()
+        || !ir.model.occurrences.is_empty()
+    {
+        return None;
+    }
+    let mut bodies = BTreeSet::new();
+    let mut suppressed = BTreeSet::new();
+    for feature in &ir.model.features {
+        let FeatureOperation::MeshImport { tessellations } =
+            feature.evaluation.definition().operation()
+        else {
+            continue;
+        };
+        if feature.suppressed == Some(true) {
+            if let MeshSelection::Tessellations(ids) = tessellations {
+                suppressed.extend(ids.iter().map(|id| id.as_str()));
+            }
+            continue;
+        }
+        match tessellations {
+            MeshSelection::Tessellations(ids) => {
+                for id in ids {
+                    bodies.insert((None, id.as_str()));
+                }
+            }
+            MeshSelection::Native {
+                native,
+                members: Some(members),
+            } => {
+                for member in members.as_slice() {
+                    bodies.insert((Some(native.as_str()), member.as_str()));
+                }
+            }
+            _ => return None,
+        }
+    }
+    // Every Fusion tessellation is a decoded mesh body, also one without a mesh-import feature.
+    for tessellation in &ir.model.tessellations {
+        let id = tessellation.id.as_str();
+        if !suppressed.contains(id) {
+            bodies.insert((None, id));
+        }
+    }
+    if bodies.is_empty() {
+        return None;
+    }
+    let message = format!(
+        "it has mesh bodies ({}), which Dutchman doesn't convert yet, and no solid bodies could be read. Convert the meshes to solids in Fusion, then save a new copy",
+        bodies.len()
+    );
+    Some(if geometry_transferred {
+        Error::NoGeometry(message)
+    } else {
+        Error::Decode(message)
+    })
 }
 
 /// Visit independent F3Z members through cadmpeg's bounded session API. Models are released
@@ -325,7 +401,7 @@ struct Phase {
     sink: Option<std::sync::Arc<dyn crate::MemberObserver>>,
     name: &'static str,
     bytes: u64,
-    started: std::time::Instant,
+    started: crate::time::Instant,
 }
 
 impl Phase {
@@ -341,7 +417,7 @@ impl Phase {
             sink,
             name,
             bytes,
-            started: std::time::Instant::now(),
+            started: crate::time::Instant::now(),
         }
     }
 }
@@ -365,7 +441,7 @@ struct Members {
     step: std::cell::RefCell<Option<Phase>>,
     bytes: u64,
     sink: std::sync::Arc<dyn crate::MemberObserver>,
-    started: std::cell::RefCell<std::collections::BTreeMap<String, std::time::Instant>>,
+    started: std::cell::RefCell<std::collections::BTreeMap<String, crate::time::Instant>>,
 }
 
 impl cadmpeg_codec_f3d::F3zMemberObserver for Members {
@@ -401,11 +477,20 @@ impl cadmpeg_codec_f3d::F3zMemberObserver for Members {
     }
 
     fn member_started(&self, path: &str) {
+        // Test builds only: a named design that never finishes, for the stuck-design limit.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("DUTCHMAN_TEST_STUCK_DESIGN").is_some_and(|stuck| stuck == path) {
+            self.sink
+                .member_event(path, crate::MemberEvent::Start, 0, None);
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
         self.phase.borrow_mut().take();
         let mut started = self.started.borrow_mut();
         // The decoder also caps archive members; bound diagnostics independently.
         if started.len() < 100_000 {
-            started.insert(path.to_owned(), std::time::Instant::now());
+            started.insert(path.to_owned(), crate::time::Instant::now());
         }
         self.sink
             .member_event(path, crate::MemberEvent::Start, 0, None);
@@ -475,7 +560,7 @@ fn drop_removed_bodies(ir: &mut cadmpeg_ir::CadIr, report: &mut Report) {
             .clone()
             .unwrap_or_else(|| "a Remove feature".to_owned());
         for id in ids {
-            if ir.model.bodies.iter().any(|body| &body.id == id)
+            if ir.geometry.bodies.iter().any(|body| &body.id == id)
                 && !removed.iter().any(|(known, _)| known == id)
             {
                 removed.push((id.clone(), name.clone()));
@@ -486,7 +571,7 @@ fn drop_removed_bodies(ir: &mut cadmpeg_ir::CadIr, report: &mut Report) {
         return;
     }
     let gone = |id: &cadmpeg_ir::ids::BodyId| removed.iter().any(|(known, _)| known == id);
-    ir.model.bodies.retain(|body| !gone(&body.id));
+    ir.geometry.bodies.retain(|body| !gone(&body.id));
     for definition in &mut ir.model.product_definitions {
         definition.bodies.retain(|id| !gone(id));
     }
@@ -510,7 +595,61 @@ fn drop_removed_bodies(ir: &mut cadmpeg_ir::CadIr, report: &mut Report) {
     }
 }
 
+/// Leaves out bodies known only to inactive configurations. Only one active configuration
+/// with resolved bodies can say which to keep; a body no configuration lists stays because
+/// unknown membership does not mean absence from the saved configuration.
+fn drop_inactive_configuration_bodies(ir: &mut cadmpeg_ir::CadIr, report: &mut Report) {
+    use std::collections::BTreeSet;
+    let mut active = ir
+        .model
+        .configurations
+        .iter()
+        .filter(|config| config.active);
+    let Some(config) = active.next() else {
+        return;
+    };
+    if active.next().is_some() {
+        return;
+    }
+    let Some(bodies) = &config.bodies else {
+        return;
+    };
+    let kept: BTreeSet<_> = bodies.iter().collect();
+    let removed: BTreeSet<_> = ir
+        .model
+        .configurations
+        .iter()
+        .filter(|config| !config.active)
+        .filter_map(|config| config.bodies.as_ref())
+        .flat_map(|bodies| bodies.iter())
+        .filter(|id| !kept.contains(id))
+        .cloned()
+        .collect();
+    let name = config.name.as_deref().unwrap_or("unnamed").to_owned();
+    let before = ir.geometry.bodies.len();
+    ir.geometry
+        .bodies
+        .retain(|body| !removed.contains(&body.id));
+    for definition in &mut ir.model.product_definitions {
+        definition.bodies.retain(|id| !removed.contains(id));
+    }
+    let count = before - ir.geometry.bodies.len();
+    if count != 0 {
+        let bodies = if count == 1 { "body" } else { "bodies" };
+        report.push_coded(
+            Severity::Info,
+            "configurations",
+            "dutchman/configuration.inactive-bodies-left-out",
+            format!(
+                "{count} {bodies} of other configurations left out; converted the saved configuration \"{name}\""
+            ),
+        );
+    }
+}
+
 fn geometry_only(ir: &mut cadmpeg_ir::CadIr) {
+    ir.design = Default::default();
+    ir.process = Default::default();
     let mut source = std::mem::take(&mut ir.model);
     macro_rules! keep {
         ($($arena:ident),+ $(,)?) => {
@@ -518,21 +657,6 @@ fn geometry_only(ir: &mut cadmpeg_ir::CadIr) {
         };
     }
     keep!(
-        bodies,
-        regions,
-        shells,
-        faces,
-        loops,
-        coedges,
-        edges,
-        vertices,
-        points,
-        surfaces,
-        curves,
-        subds,
-        pcurves,
-        procedural_surfaces,
-        procedural_curves,
         assets,
         product_definitions,
         occurrences,
@@ -634,20 +758,25 @@ pub(crate) fn check_facts(
             .map(|entity| entity.id().as_str()),
     );
     let curves: BTreeMap<_, _> = ir
-        .model
+        .geometry
         .curves
         .iter()
         .map(|c| (c.id.as_str(), &c.geometry))
         .collect();
     let pcurves: BTreeMap<_, _> = ir
-        .model
+        .geometry
         .pcurves
         .iter()
         .map(|c| (c.id.as_str(), &c.geometry))
         .collect();
-    let edges: BTreeMap<_, _> = ir.model.edges.iter().map(|e| (e.id.as_str(), e)).collect();
+    let edges: BTreeMap<_, _> = ir
+        .geometry
+        .edges
+        .iter()
+        .map(|e| (e.id.as_str(), e))
+        .collect();
     let coedges: BTreeMap<_, _> = ir
-        .model
+        .geometry
         .coedges
         .iter()
         .map(|c| (c.id.as_str(), c))
@@ -842,17 +971,130 @@ mod tests {
         .unwrap()
     }
 
+    fn mesh_import(selection: serde_json::Value) -> cadmpeg_ir::features::Feature {
+        serde_json::from_value(serde_json::json!({"id": "test:model:feature#mesh", "ordinal": 0, "suppressed": false, "definition": {"kind": "operation", "value": {"kind": "mesh_import", "value": {"tessellations": selection}}}, "dependencies": [], "source_properties": {}, "source_content": [], "outputs": []}))
+        .unwrap()
+    }
+
+    #[test]
+    fn mesh_only_diagnostic_uses_decoded_members_before_the_geometry_gate() {
+        let mut model = cube();
+        model.ir.model.features =
+            vec![mesh_import(serde_json::json!({"kind": "native", "value": {
+                "native": "test:model:source#mesh", "members": ["17", "23"]
+            }}))];
+        // A mixed design keeps its existing conversion and losses.
+        assert!(mesh_only_error(Format::FusionArchive, &model.ir, false).is_none());
+        model.ir.geometry.bodies.clear();
+        let error = mesh_only_error(Format::FusionArchive, &model.ir, false).unwrap();
+        assert_eq!(error.stage(), Stage::Decode);
+        assert_eq!(error.upstream(), Some("cadmpeg"));
+        let transferred = mesh_only_error(Format::FusionArchive, &model.ir, true).unwrap();
+        assert_eq!(transferred.stage(), Stage::Project);
+        assert_eq!(transferred.kind(), "no_geometry");
+        assert!(transferred
+            .to_string()
+            .starts_with("cannot convert this design:"));
+        assert_eq!(error.to_string(), "cannot read this design: it has mesh bodies (2), which Dutchman doesn't convert yet, and no solid bodies could be read. Convert the meshes to solids in Fusion, then save a new copy");
+        assert!(mesh_only_error(Format::InventorPart, &model.ir, false).is_none());
+        assert!(mesh_only_error(Format::FusionMultiDocument, &model.ir, false).is_some());
+        model.ir.model.features[0].suppressed = Some(true);
+        assert!(mesh_only_error(Format::FusionArchive, &model.ir, false).is_none());
+    }
+
+    #[test]
+    fn mesh_only_diagnostic_does_not_invent_counts_for_unresolved_sources() {
+        let mut model = cube();
+        model.ir.geometry.bodies.clear();
+        for selection in [
+            serde_json::json!({"kind": "native", "value": {"native": "test:model:source#mesh"}}),
+            serde_json::json!({"kind": "unresolved", "value": {"feature": "test:model:feature#mesh"}}),
+        ] {
+            model.ir.model.features = vec![mesh_import(selection)];
+            assert!(mesh_only_error(Format::FusionArchive, &model.ir, false).is_none());
+        }
+        model.ir.model.features.clear();
+        assert!(mesh_only_error(Format::FusionArchive, &model.ir, false).is_none());
+    }
+
+    #[test]
+    fn mesh_only_diagnostic_deduplicates_resolved_tessellation_identities() {
+        let mut model = cube();
+        model.ir.geometry.bodies.clear();
+        let feature = mesh_import(
+            serde_json::json!({"kind": "tessellations", "value": ["test:model:tessellation#mesh"]}),
+        );
+        model.ir.model.features = vec![feature.clone(), feature];
+        let error = mesh_only_error(Format::FusionArchive, &model.ir, false).unwrap();
+        assert!(error.to_string().contains("has mesh bodies (1)"));
+    }
+
+    fn tessellation(id: &str) -> cadmpeg_ir::tessellation::Tessellation {
+        use cadmpeg_ir::math::Point3;
+        use cadmpeg_ir::tessellation::{Tessellation, TessellationId, TessellationMesh};
+        let point = |x: f64, y: f64, z: f64| Point3 { x, y, z };
+        let mesh = TessellationMesh::List {
+            vertices: vec![
+                point(0.0, 0.0, 0.0),
+                point(10.0, 0.0, 0.0),
+                point(0.0, 10.0, 0.0),
+            ],
+            triangles: vec![[0, 1, 2]],
+        };
+        Tessellation::new(TessellationId::mint(id).unwrap(), mesh, Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn mesh_only_diagnostic_counts_decoded_meshes_without_a_mesh_import() {
+        let mut model = cube();
+        model.ir.model.features.clear();
+        model.ir.model.tessellations = vec![
+            tessellation("test:model:tessellation#a"),
+            tessellation("test:model:tessellation#b"),
+        ];
+        // A design with B-rep bodies keeps its conversion.
+        assert!(mesh_only_error(Format::FusionArchive, &model.ir, true).is_none());
+        model.ir.geometry.bodies.clear();
+        let error = mesh_only_error(Format::FusionArchive, &model.ir, true).unwrap();
+        assert_eq!(error.stage(), Stage::Project);
+        assert_eq!(error.kind(), "no_geometry");
+        assert_eq!(error.to_string(), "cannot convert this design: it has mesh bodies (2), which Dutchman doesn't convert yet, and no solid bodies could be read. Convert the meshes to solids in Fusion, then save a new copy");
+        assert!(mesh_only_error(Format::InventorPart, &model.ir, true).is_none());
+    }
+
+    #[test]
+    fn mesh_only_diagnostic_counts_an_imported_mesh_once() {
+        let mut model = cube();
+        model.ir.geometry.bodies.clear();
+        model.ir.model.tessellations = vec![tessellation("test:model:tessellation#mesh")];
+        model.ir.model.features = vec![mesh_import(
+            serde_json::json!({"kind": "tessellations", "value": ["test:model:tessellation#mesh"]}),
+        )];
+        let error = mesh_only_error(Format::FusionArchive, &model.ir, true).unwrap();
+        assert!(error.to_string().contains("has mesh bodies (1)"));
+        model.ir.model.features[0].suppressed = Some(true);
+        assert!(mesh_only_error(Format::FusionArchive, &model.ir, true).is_none());
+    }
+
+    #[test]
+    fn mesh_only_diagnostic_adds_decoded_meshes_to_native_members() {
+        let mut model = cube();
+        model.ir.geometry.bodies.clear();
+        model.ir.model.tessellations = vec![tessellation("test:model:tessellation#decoded")];
+        model.ir.model.features =
+            vec![mesh_import(serde_json::json!({"kind": "native", "value": {
+                "native": "test:model:source#mesh", "members": ["17", "23"]
+            }}))];
+        let error = mesh_only_error(Format::FusionArchive, &model.ir, false).unwrap();
+        assert!(error.to_string().contains("has mesh bodies (3)"));
+    }
+
     #[test]
     fn duplicate_parameters_are_removed_before_geometry_validation() {
         let mut source = cube();
         for ordinal in 0..2 {
             source.ir.model.parameters.push(
-                serde_json::from_value(serde_json::json!({
-                    "id": format!("test:design:parameter#{ordinal}"),
-                    "ordinal": ordinal,
-                    "name": "HoleOffset",
-                    "expression": "2 mm"
-                }))
+                serde_json::from_value(serde_json::json!({"id": format!("test:design:parameter#{ordinal}"), "ordinal": ordinal, "name": "HoleOffset", "expression": "2 mm", "dependencies": [], "properties": {}}))
                 .unwrap(),
             );
         }
@@ -871,23 +1113,12 @@ mod tests {
         );
 
         source.ir.model.sketches.push(
-            serde_json::from_value(serde_json::json!({
-                "id": "test:design:sketch#1",
-                "placement": {"kind": "unresolved"}
-            }))
+            serde_json::from_value(serde_json::json!({"id": "test:design:sketch#1", "placement": {"kind": "unresolved"}, "profiles": []}))
             .unwrap(),
         );
         for ordinal in 0..2 {
             source.ir.model.features.push(
-                serde_json::from_value(serde_json::json!({
-                    "id": format!("test:design:feature#{ordinal}"),
-                    "ordinal": ordinal,
-                    "suppressed": false,
-                    "definition": {
-                        "definition": "sketch",
-                        "sketch": {"space": "planar", "sketch": "test:design:sketch#1"}
-                    }
-                }))
+                serde_json::from_value(serde_json::json!({"id": format!("test:design:feature#{ordinal}"), "ordinal": ordinal, "suppressed": false, "definition": {"kind": "operation", "value": {"kind": "sketch", "value": {"sketch": {"kind": "planar", "sketch": "test:design:sketch#1"}}}}, "dependencies": [], "source_properties": {}, "source_content": [], "outputs": []}))
                 .unwrap(),
             );
         }
@@ -899,18 +1130,14 @@ mod tests {
             .set_feature_regeneration_parent(&child, &parent)
             .unwrap();
         source.ir.model.configurations.push(
-            serde_json::from_value(serde_json::json!({
-                "id": "test:design:configuration#1",
-                "parameter_overrides": {"test:design:parameter#0": "HoleOffset + 1 mm"},
-                "properties": {"HoleOffset": "2 mm"}
-            }))
+            serde_json::from_value(serde_json::json!({"id": "test:design:configuration#1", "parameter_overrides": {"test:design:parameter#0": "HoleOffset + 1 mm"}, "properties": {"HoleOffset": "2 mm"}, "ordinal": 0, "active": false, "parameter_values": {}, "feature_states": {}}))
             .unwrap(),
         );
         let mut joint = cadmpeg_ir::products::AssemblyJoint::grounded(
             cadmpeg_ir::products::JointId::mint("test:assembly:joint#1").unwrap(),
             cadmpeg_ir::products::JointConnector {
                 operand: cadmpeg_ir::products::JointOperand::root(
-                    source.ir.model.bodies[0].id.as_str(),
+                    source.ir.geometry.bodies[0].id.as_str(),
                     Vec::new(),
                 ),
                 frame: cadmpeg_ir::transform::Transform::identity(),
@@ -924,8 +1151,8 @@ mod tests {
         let mut report = Report::default();
         let mut model = source.clone();
         with_fallback(&mut model.ir, &mut report, &policy(), 0).unwrap();
-        assert_eq!(model.ir.model.bodies.len(), 1);
-        assert_eq!(model.ir.model.bodies, source.ir.model.bodies);
+        assert_eq!(model.ir.geometry.bodies.len(), 1);
+        assert_eq!(model.ir.geometry.bodies, source.ir.geometry.bodies);
         assert_eq!(
             model.ir.model.product_definitions,
             source.ir.model.product_definitions
@@ -933,7 +1160,10 @@ mod tests {
         assert_eq!(model.ir.model.occurrences, source.ir.model.occurrences);
         assert_eq!(model.ir.model.appearances, source.ir.model.appearances);
         assert!(model.ir.model.parameters.is_empty());
-        assert!(model.ir.model.populated_design_arena().is_none());
+        assert!(model
+            .ir
+            .populated_arena(cadmpeg_core::decode::ArenaClass::Design)
+            .is_none());
         assert!(model.ir.model.feature_regeneration_parent(&child).is_none());
         joint.driving_parameter = None;
         assert_eq!(model.ir.model.assembly_joints, vec![joint]);
@@ -950,7 +1180,11 @@ mod tests {
     #[test]
     fn geometry_validation_still_rejects_duplicate_bodies() {
         let mut model = cube();
-        model.ir.model.bodies.push(model.ir.model.bodies[0].clone());
+        model
+            .ir
+            .geometry
+            .bodies
+            .push(model.ir.geometry.bodies[0].clone());
         let failure = validate_decoded(
             &mut model.ir,
             DecodeDepth::Geometry,
@@ -965,13 +1199,7 @@ mod tests {
     #[test]
     fn a_body_an_active_remove_deletes_is_left_out() {
         let remove = |suppressed: bool| -> cadmpeg_ir::Feature {
-            serde_json::from_value(serde_json::json!({
-                "id": format!("test:model:feature#{suppressed}"), "ordinal": 9,
-                "name": "RemoveBody 1", "suppressed": suppressed,
-                "definition": {"definition": "delete_body",
-                    "bodies": {"kind": "bodies", "value": [cube().ir.model.bodies[0].id.clone()]},
-                    "mode": "delete_selected"}
-            }))
+            serde_json::from_value(serde_json::json!({"id": format!("test:model:feature#{suppressed}"), "ordinal": 9, "name": "RemoveBody 1", "suppressed": suppressed, "definition": {"kind": "operation", "value": {"kind": "delete_body", "value": {"bodies": {"kind": "bodies", "value": [cube().ir.geometry.bodies[0].id.clone()]}, "mode": "delete_selected"}}}, "dependencies": [], "source_properties": {}, "source_content": [], "outputs": []}))
             .unwrap()
         };
         // A suppressed Remove deletes nothing.
@@ -979,14 +1207,14 @@ mod tests {
         model.ir.model.features.push(remove(true));
         let mut report = Report::default();
         drop_removed_bodies(&mut model.ir, &mut report);
-        assert_eq!(model.ir.model.bodies.len(), 1);
+        assert_eq!(model.ir.geometry.bodies.len(), 1);
         assert!(report.losses().is_empty());
 
         let mut model = cube();
         model.ir.model.features.push(remove(false));
         let mut report = Report::default();
         drop_removed_bodies(&mut model.ir, &mut report);
-        assert!(model.ir.model.bodies.is_empty());
+        assert!(model.ir.geometry.bodies.is_empty());
         let loss = report.losses().first().unwrap();
         assert_eq!(loss.subject, "feature \"RemoveBody 1\"");
         assert_eq!(
@@ -995,14 +1223,121 @@ mod tests {
         );
     }
 
+    fn configuration_bodies() -> cadmpeg_ir::CadIr {
+        let mut ir = cadmpeg_ir::CadIr::empty();
+        for id in ["test:model:body#A", "test:model:body#B"] {
+            ir.geometry.bodies.push(
+                serde_json::from_value(serde_json::json!({"id": id, "kind": "solid"})).unwrap(),
+            );
+        }
+        ir.model.product_definitions.push(
+            serde_json::from_value(serde_json::json!({"id": "test:product:definition#0", "kind": "part", "bodies": ["test:model:body#A", "test:model:body#B"], "bom_properties": {}, "sketches": []}))
+            .unwrap(),
+        );
+        for (ordinal, name, body, active) in [(0, "Short", "A", true), (1, "Tall", "B", false)] {
+            ir.model.configurations.push(
+                serde_json::from_value(serde_json::json!({"id": format!("test:design:configuration#{ordinal}"), "ordinal": ordinal, "name": name, "active": active, "bodies": [format!("test:model:body#{body}")], "properties": {}, "parameter_overrides": {}, "parameter_values": {}, "feature_states": {}}))
+                .unwrap(),
+            );
+        }
+        ir
+    }
+
+    #[test]
+    fn inactive_configuration_bodies_are_left_out_and_reported() {
+        let mut ir = configuration_bodies();
+        let mut report = Report::default();
+        drop_inactive_configuration_bodies(&mut ir, &mut report);
+        assert_eq!(ir.geometry.bodies.len(), 1);
+        assert_eq!(ir.geometry.bodies[0].id.as_str(), "test:model:body#A");
+        assert_eq!(ir.model.product_definitions[0].bodies.len(), 1);
+        assert_eq!(
+            ir.model.product_definitions[0].bodies[0],
+            ir.geometry.bodies[0].id
+        );
+        assert_eq!(report.losses().len(), 1);
+        let loss = &report.losses()[0];
+        assert_eq!(loss.severity, Severity::Info);
+        assert_eq!(loss.subject, "configurations");
+        assert_eq!(
+            loss.code.as_deref(),
+            Some("dutchman/configuration.inactive-bodies-left-out")
+        );
+        assert_eq!(
+            loss.detail,
+            "1 body of other configurations left out; converted the saved configuration \"Short\""
+        );
+        drop_inactive_configuration_bodies(&mut ir, &mut report);
+        assert_eq!(report.losses().len(), 1);
+    }
+
+    #[test]
+    fn bodies_with_unknown_configuration_membership_are_kept() {
+        let mut ir = configuration_bodies();
+        ir.geometry.bodies.push(
+            serde_json::from_value(serde_json::json!({"id": "test:model:body#C", "kind": "solid"}))
+                .unwrap(),
+        );
+        drop_inactive_configuration_bodies(&mut ir, &mut Report::default());
+        assert_eq!(ir.geometry.bodies.len(), 2);
+        assert_eq!(ir.geometry.bodies[0].id.as_str(), "test:model:body#A");
+        assert_eq!(ir.geometry.bodies[1].id.as_str(), "test:model:body#C");
+    }
+
+    #[test]
+    fn active_configuration_bodies_are_kept_even_when_shared() {
+        let mut ir = configuration_bodies();
+        ir.model.configurations[1].bodies = ir.model.configurations[0].bodies.clone();
+        let source = ir.clone();
+        let mut report = Report::default();
+        drop_inactive_configuration_bodies(&mut ir, &mut report);
+        assert_eq!(ir, source);
+        assert!(report.losses().is_empty());
+    }
+
+    #[test]
+    fn unresolved_active_configuration_bodies_leave_every_body() {
+        let mut ir = configuration_bodies();
+        ir.model.configurations[0].bodies = None;
+        let source = ir.clone();
+        let mut report = Report::default();
+        drop_inactive_configuration_bodies(&mut ir, &mut report);
+        assert_eq!(ir, source);
+        assert!(report.losses().is_empty());
+    }
+
+    #[test]
+    fn two_active_configurations_leave_every_body() {
+        let mut ir = configuration_bodies();
+        ir.model.configurations[1].active = true;
+        let source = ir.clone();
+        let mut report = Report::default();
+        drop_inactive_configuration_bodies(&mut ir, &mut report);
+        assert_eq!(ir, source);
+        assert!(report.losses().is_empty());
+    }
+
+    #[test]
+    fn no_active_configuration_leaves_every_body() {
+        let mut ir = configuration_bodies();
+        ir.model.configurations[0].active = false;
+        let source = ir.clone();
+        let mut report = Report::default();
+        drop_inactive_configuration_bodies(&mut ir, &mut report);
+        assert_eq!(ir, source);
+        assert!(report.losses().is_empty());
+        ir.model.configurations.clear();
+        let source = ir.clone();
+        drop_inactive_configuration_bodies(&mut ir, &mut report);
+        assert_eq!(ir, source);
+        assert!(report.losses().is_empty());
+    }
+
     #[test]
     fn geometry_alone_leaves_no_definition_naming_a_removed_sketch() {
         let mut model = cube();
         model.ir.model.product_definitions.push(
-            serde_json::from_value(serde_json::json!({
-                "id": "test:product:definition#0", "kind": "part",
-                "sketches": ["test:model:sketch#0"]
-            }))
+            serde_json::from_value(serde_json::json!({"id": "test:product:definition#0", "kind": "part", "sketches": ["test:model:sketch#0"], "bom_properties": {}, "bodies": []}))
             .unwrap(),
         );
         geometry_only(&mut model.ir);
@@ -1017,7 +1352,11 @@ mod tests {
     #[test]
     fn geometry_errors_stop_without_discarding_history() {
         let mut model = cube();
-        model.ir.model.bodies.push(model.ir.model.bodies[0].clone());
+        model
+            .ir
+            .geometry
+            .bodies
+            .push(model.ir.geometry.bodies[0].clone());
         let error = with_fallback(&mut model.ir, &mut Report::default(), &policy(), 0).unwrap_err();
         assert!(error.to_string().contains("retry was not needed"));
         assert_eq!(error.stage(), Stage::Project);
@@ -1033,14 +1372,15 @@ mod tests {
         let mut model = cube();
         for ordinal in 0..2 {
             model.ir.model.parameters.push(
-                serde_json::from_value(serde_json::json!({
-                    "id": format!("test:design:parameter#{ordinal}"), "ordinal": ordinal,
-                    "name": "PrivateParameter", "expression": "2 mm"
-                }))
+                serde_json::from_value(serde_json::json!({"id": format!("test:design:parameter#{ordinal}"), "ordinal": ordinal, "name": "PrivateParameter", "expression": "2 mm", "dependencies": [], "properties": {}}))
                 .unwrap(),
             );
         }
-        model.ir.model.bodies.push(model.ir.model.bodies[0].clone());
+        model
+            .ir
+            .geometry
+            .bodies
+            .push(model.ir.geometry.bodies[0].clone());
         let error = with_fallback(&mut model.ir, &mut Report::default(), &policy(), 0).unwrap_err();
         assert!(error.to_string().contains("checked as geometry alone"));
         assert!(error.to_string().contains("it still fails them"));
@@ -1055,9 +1395,9 @@ mod tests {
     fn structured_findings_classify_references_and_never_keep_private_text() {
         use cadmpeg_ir::report::check::{Check, Finding};
         let mut model = cube();
-        model.ir.model.coedges[0].pcurves.clear();
-        let curve_id = model.ir.model.curves[0].id.clone();
-        model.ir.model.coedges[0].use_curve = Some(
+        model.ir.geometry.coedges[0].pcurves.clear();
+        let curve_id = model.ir.geometry.curves[0].id.clone();
+        model.ir.geometry.coedges[0].use_curve = Some(
             serde_json::from_value(serde_json::json!({
                 "curve": curve_id, "parameter_range": [0.0, 1.0]
             }))
@@ -1066,7 +1406,7 @@ mod tests {
         let findings = vec![Finding {
             check: Check::ParameterDomain,
             severity: CadmpegSeverity::Error,
-            entity: Some(model.ir.model.coedges[0].id.to_string()),
+            entity: Some(model.ir.geometry.coedges[0].id.to_string()),
             related: Vec::new(),
             message: "PrivateName 123.456 /private/design.f3z".into(),
         }];
@@ -1074,8 +1414,8 @@ mod tests {
         assert!(!facts.retry);
         assert_eq!(facts.findings.get("parameter_domain"), Some(&1));
         assert_eq!(facts.curve_kinds.get("analytic"), Some(&1));
-        model.ir.model.curves[0].geometry = serde_json::from_value(serde_json::json!({
-            "kind": "procedural", "construction": "test:model:procedural_curve#0"
+        model.ir.geometry.curves[0].geometry = serde_json::from_value(serde_json::json!({
+            "kind": "procedural", "value": {"construction": "test:model:procedural_curve#0"}
         }))
         .unwrap();
         assert_eq!(
@@ -1084,11 +1424,11 @@ mod tests {
                 .get("procedural"),
             Some(&1)
         );
-        model.ir.model.curves[0].geometry = serde_json::from_value(serde_json::json!({
+        model.ir.geometry.curves[0].geometry = cadmpeg_ir::geometry::CurveGeometry::Solved(serde_json::from_value(serde_json::json!({
             "kind": "nurbs", "degree": 1, "knots": [0.0, 0.0, 1.0, 1.0],
-            "poles": {"form": "polynomial", "points": [{"x": 0.0, "y": 0.0, "z": 0.0}, {"x": 1.0, "y": 0.0, "z": 0.0}]},
+            "poles": {"kind": "polynomial", "points": [{"x": 0.0, "y": 0.0, "z": 0.0}, {"x": 1.0, "y": 0.0, "z": 0.0}]},
             "periodic": false
-        })).unwrap();
+        })).unwrap());
         assert_eq!(
             check_facts(&model.ir, &findings).curve_kinds.get("nurbs"),
             Some(&1)

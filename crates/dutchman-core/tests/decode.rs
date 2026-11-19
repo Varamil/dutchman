@@ -68,8 +68,8 @@ fn decodes_a_fusion_unit_cube() {
     .unwrap();
 
     assert_eq!(model.name, "generated_unit_cube");
-    assert_eq!(model.ir.model.bodies.len(), 1);
-    assert_eq!(model.ir.model.faces.len(), 6);
+    assert_eq!(model.ir.geometry.bodies.len(), 1);
+    assert_eq!(model.ir.geometry.faces.len(), 6);
     assert!(model.fidelity.is_some());
 }
 
@@ -85,8 +85,8 @@ fn decodes_an_inventor_unit_cube() {
 
     assert_eq!(model.name, "synthetic_cube");
     assert_eq!(model.source_file.as_deref(), Some("synthetic_cube.ipt"));
-    assert_eq!(model.ir.model.bodies.len(), 1);
-    assert_eq!(model.ir.model.faces.len(), 6);
+    assert_eq!(model.ir.geometry.bodies.len(), 1);
+    assert_eq!(model.ir.geometry.faces.len(), 6);
 }
 
 #[test]
@@ -102,8 +102,8 @@ fn decodes_an_edrawings_cube() {
 
     assert_eq!(model.name, "synthetic_cube");
     assert_eq!(model.source_file.as_deref(), Some("synthetic_cube.eprt"));
-    assert_eq!(model.ir.model.bodies.len(), 1);
-    assert_eq!(model.ir.model.faces.len(), 6);
+    assert_eq!(model.ir.geometry.bodies.len(), 1);
+    assert_eq!(model.ir.geometry.faces.len(), 6);
     assert!(
         model.ir.model.features.is_empty(),
         "eDrawings files carry no history"
@@ -128,7 +128,7 @@ fn decodes_an_edrawings_assembly_from_its_one_file() {
     .unwrap();
 
     assert_eq!(model.name, "synthetic_assembly");
-    assert_eq!(model.ir.model.bodies.len(), 2);
+    assert_eq!(model.ir.geometry.bodies.len(), 2);
     let assembly = model.assembly.as_ref().unwrap();
     assert!(!assembly.placements.is_empty());
     assert!(assembly.left_out.is_empty(), "{:?}", assembly.left_out);
@@ -146,7 +146,7 @@ fn decodes_a_solidworks_written_edrawings_assembly() {
     .unwrap();
 
     assert_eq!(model.name, "synthetic_sw_assembly");
-    assert_eq!(model.ir.model.bodies.len(), 3);
+    assert_eq!(model.ir.geometry.bodies.len(), 3);
     let assembly = model.assembly.as_ref().unwrap();
     assert!(!assembly.placements.is_empty());
     assert!(assembly.left_out.is_empty(), "{:?}", assembly.left_out);
@@ -164,8 +164,8 @@ fn decodes_a_solidworks_unit_cube() {
 
     assert_eq!(model.name, "solidworks_cube");
     assert_eq!(model.source_file.as_deref(), Some("solidworks_cube.sldprt"));
-    assert_eq!(model.ir.model.bodies.len(), 1);
-    assert_eq!(model.ir.model.faces.len(), 6);
+    assert_eq!(model.ir.geometry.bodies.len(), 1);
+    assert_eq!(model.ir.geometry.faces.len(), 6);
     assert!(
         model.ir.model.features.is_empty(),
         "the cube has no history"
@@ -270,8 +270,8 @@ fn recognises_all_format_extensions_and_shared_part_contents() {
         ("nx.prt", b"SPLMSSTR", Format::NxPart),
         ("nx.prt.3", b"SPLMSSTR", Format::NxPart),
         ("x.pvz", b"PK\x03\x04", Format::CreoView),
-        ("x.eprt", b"PK", Format::EdrawingsPart),
-        ("x.easm", b"PK", Format::EdrawingsAssembly),
+        ("x.eprt", b"PK\x03\x04", Format::EdrawingsPart),
+        ("x.easm", b"PK\x03\x04", Format::EdrawingsAssembly),
         ("x.3dm", b"3D Geometry File Format       80", Format::Rhino),
         ("x.sat", b"700 0 0 0\n", Format::Acis),
         ("x.sab", b"ACIS BinaryFile", Format::Acis),
@@ -321,11 +321,7 @@ fn a_numbered_save_strips_one_suffix_and_uses_contents_for_its_program() {
             Format::CreoPart,
             "opens, no geometry yet",
         ),
-        (
-            b"SPLMSSTR".as_slice(),
-            Format::NxPart,
-            "opens, no geometry yet",
-        ),
+        (b"SPLMSSTR".as_slice(), Format::NxPart, "reads geometry"),
         (
             b"unknown".as_slice(),
             Format::UnclassifiedPart,
@@ -348,7 +344,7 @@ fn conversion_requires_geometry_and_an_available_codec() {
     for format in Format::ALL {
         let geometry = !matches!(
             format,
-            Format::CreoPart | Format::NxPart | Format::UnclassifiedPart | Format::Iges
+            Format::CreoPart | Format::UnclassifiedPart | Format::Iges
         );
         assert_eq!(format.reads_geometry(), geometry, "{}", format.name());
         assert_eq!(
@@ -378,15 +374,22 @@ fn published_headlines_are_independent_of_codec_availability() {
 
 #[test]
 fn inputs_without_geometry_are_refused_before_decoding() {
-    for (name, bytes, format) in [
-        ("low-creo.prt", b"#UGC:2".as_slice(), Format::CreoPart),
-        ("low-nx.prt", b"SPLMSSTR".as_slice(), Format::NxPart),
-    ] {
-        let path = scratch(name, bytes);
-        let err = read(format, &path, &mut Report::default()).unwrap_err();
-        assert!(matches!(err, Error::NotSupportedYet { .. }));
-        assert!(err.to_string().contains("opens, no geometry yet"));
-    }
+    let path = scratch("low-creo.prt", b"#UGC:2");
+    let err = read(Format::CreoPart, &path, &mut Report::default()).unwrap_err();
+    assert!(matches!(err, Error::NotSupportedYet { .. }));
+    assert!(err.to_string().contains("opens, no geometry yet"));
+}
+
+#[test]
+fn nx_parts_reach_the_decoder_and_a_truncated_one_is_an_error() {
+    // A signature with no body: NX is read now, so this gets to cadmpeg's NX decoder and
+    // comes back as an error rather than the old "no geometry yet" refusal or a crash.
+    let path = scratch("truncated-nx.prt", b"SPLMSSTR");
+    assert_eq!(Format::from_path(&path), Some(Format::NxPart));
+    assert!(Format::NxPart.can_convert());
+    let err = read(Format::NxPart, &path, &mut Report::default()).unwrap_err();
+    assert!(!matches!(err, Error::NotSupportedYet { .. }), "{err}");
+    assert!(!err.to_string().contains("no geometry yet"), "{err}");
 }
 
 #[test]
@@ -431,7 +434,7 @@ fn progress_counts_successful_documents_and_preserves_read_results() {
         Some(&progress),
     )
     .unwrap();
-    assert_eq!(model.ir.model.bodies.len(), 1);
+    assert_eq!(model.ir.geometry.bodies.len(), 1);
     let events = events.into_inner().unwrap();
     assert_eq!(events.last().unwrap().designs_read, 1);
     assert_eq!(events.last().unwrap().designs_total, Some(1));

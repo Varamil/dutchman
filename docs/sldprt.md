@@ -6,8 +6,13 @@ decoding land in cadmpeg and reach Dutchman when the pin is bumped. This page sa
 Dutchman makes of what that codec gives, and which upstream gaps keep SolidWorks history from
 replaying. It drives what is asked of cadmpeg next.
 
-State at the cadmpeg commit pinned in `Cargo.toml`. `dutchman formats` reports the reader's
-current reader status alongside what Dutchman converts.
+State at the cadmpeg commit pinned in `Cargo.toml` (`9249a19b`, after cadmpeg 0.6.12).
+`dutchman formats` reports the reader's current reader status alongside what Dutchman converts.
+
+Compact extrusion continuation records now supply their join or cut operation when their
+owning feature and class resolve. An extrusion whose start is not the sketch plane stays
+unresolved and reported. Unresolved profiles and sketch bindings remain the history blockers
+described below.
 
 ## Parts (`.sldprt`)
 
@@ -20,6 +25,16 @@ current reader status alongside what Dutchman converts.
 | Parameters, with their expressions (`Depth = 12.5mm`). | Mapped to SolidCraft parameters when the history maps. |
 | Feature history from the Keywords XML: extrusions with their operation, extent and depth; sketches; suppression state; many features only as `native` records. | Keeps editable features before the first blocker and resolved sketches, hidden beside the imported final shape; the report names the blocker (below). Without a body-building prefix, keeps reference sketches beside the import. |
 | Sketch geometry from the ResolvedFeatures records: lines, arcs, circles, ellipses, splines, coincidences, with a resolved plane. | Read only through a sketch feature that binds it (below). |
+
+A part saved with several configurations converts in the configuration it was saved in.
+Bodies belonging only to the other configurations are left out, and the report says so.
+Source bodies retained for derived or mirrored geometry are also left out of the current
+body set. Unresolved body, shell, or face ownership is reported.
+
+Closed faces without boundary edges and closed ring edges without vertices are retained
+when their surfaces and curves resolve. More offset surfaces decode over analytic, NURBS,
+and swept supports. Offsets whose support orientation, distance, or trim boundaries cannot
+be resolved remain reported losses.
 
 Parts read by 0.1.5 that 0.2.0 to 0.2.2 read empty, with fewer bodies, or failing cadmpeg's
 edge checks read again since 0.2.3: cadmpeg no longer lets bytes inside other
@@ -78,6 +93,9 @@ Assemblies convert as placed parts and nested components. cadmpeg supplies produ
 occurrences and placements; Dutchman resolves external `.sldprt` and `.sldasm` references
 through the shared assembly file finder. Absolute Windows paths are matched by file name,
 case-insensitively, beside the assembly first, then through the project and `--search` folders.
+When none of the assembly's part files can be found or read, and the assembly holds no bodies
+of its own, conversion stops with "none of the assembly's parts could be found or read", and the
+report lists each part file it looked for.
 See [finding part files](inventor.md#finding-the-part-files) for the shared search rules.
 
 Local sub-assemblies keep their component tree. Referenced assembly files are read recursively,

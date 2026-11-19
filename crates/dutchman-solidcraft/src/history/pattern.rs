@@ -16,6 +16,8 @@ const FULL_TURN: f64 = 1e-9;
 
 /// Bound the work a pattern asks SolidCraft to replay.
 const MAX_INSTANCES: u64 = 10_000;
+/// Bound feature/body seed lists, including blends expanded after replay.
+pub(super) const MAX_SEEDS: usize = 10_000;
 
 /// Maps a pattern feature whose operation is `definition`.
 pub(crate) fn map(
@@ -35,7 +37,7 @@ pub(crate) fn map(
         } else {
             "it patterns nothing"
         })?;
-    if seeds.len() > 10_000 {
+    if seeds.len() > MAX_SEEDS {
         return Err("patterns with more than 10000 seeds are not supported yet".to_owned());
     }
     let mut features = Vec::with_capacity(seeds.len());
@@ -56,13 +58,13 @@ pub(crate) fn map(
                 } else {
                     features.push(name.clone());
                 }
-                if features.len() > 10_000 {
+                if features.len() > MAX_SEEDS {
                     return Err("patterns with more than 10000 seeds are not supported yet".to_owned());
                 }
             }
             Some("bodies") => {
                 bodies.extend(body_seeds(seed.get("value"), ctx)?);
-                if bodies.len() > 10_000 {
+                if bodies.len() > MAX_SEEDS {
                     return Err("patterns with more than 10000 body seeds are not supported yet".to_owned());
                 }
             }
@@ -206,7 +208,7 @@ fn chain(
                 )
             };
         instances = instances.saturating_mul(count);
-        if instances > MAX_INSTANCES || features.len() > 10_000 {
+        if instances > MAX_INSTANCES || features.len() > MAX_SEEDS {
             return Err("patterns with more than 10000 instances are not supported yet".to_owned());
         }
         let stage_name = if index + 1 == stages.len() {
@@ -646,7 +648,7 @@ mod tests {
             ),
         ] {
             let wire = Value::Null;
-            let mut ctx = Context::new(&wire);
+            let mut ctx = Context::testing(&wire);
             ctx.target_version = crate::SolidCraftVersion::V0_25_1;
             let mut preceding = vec![json!({"name": "Earlier"})];
             let result = chain(
@@ -665,9 +667,7 @@ mod tests {
 
     #[test]
     fn linear_patterns_become_rectangular() {
-        let linear = json!({"kind": "linear", "direction": {"x": 2.0, "y": 0.0, "z": 0.0},
-            "spacing": 20.0, "count": 3,
-            "second": {"direction": {"x": 0.0, "y": 1.0, "z": 0.0}, "spacing": 15.0, "count": 2}});
+        let linear = json!({"kind": "linear", "direction": {"x": 2.0, "y": 0.0, "z": 0.0}, "spacing": 20.0, "count": 3, "second": {"direction": {"x": 0.0, "y": 1.0, "z": 0.0}, "spacing": 15.0, "count": 2, "symmetric": false}, "omitted_instances": [], "symmetric": false});
         assert_eq!(
             layout(Some(&linear)).unwrap(),
             json!({"type": "rectangular", "dir1": [1.0, 0.0, 0.0], "count1": "3",
@@ -713,13 +713,13 @@ mod tests {
             );
         }
         assert!(layout(Some(&circular(TAU / 4.0, 0))).is_err());
-        assert!(layout(Some(&json!({"kind": "linear", "spacing": 1.0, "count": 2}))).is_err());
+        assert!(layout(Some(&json!({"kind": "linear", "spacing": 1.0, "count": 2, "omitted_instances": [], "symmetric": false}))).is_err());
     }
     #[test]
     fn patterns_cadmpeg_does_not_decode_say_so() {
         let model = json!({});
         let reason = |definition: Value| {
-            let mut ctx = Context::new(&model);
+            let mut ctx = Context::testing(&model);
             map(
                 &json!({"name": "Pattern"}),
                 &definition,

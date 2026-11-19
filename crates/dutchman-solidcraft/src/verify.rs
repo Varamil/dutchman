@@ -3,33 +3,49 @@
 //! SolidCraft makes any kernel difference cancel out), and geometry written as an import
 //! against what the model holds.
 
+use crate::SolidCraftEvaluator;
+use dutchman_core::time::Instant;
 use std::path::{Path, PathBuf};
+#[cfg(not(target_family = "wasm"))]
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::Value;
 
+#[cfg(not(target_family = "wasm"))]
 #[path = "version_cache.rs"]
 mod version_cache;
 
 /// How long CLI version discovery may run.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) const VERSION_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The relative difference in volume at which a replay no longer matches the original, when
 /// SolidCraft gives no area and box to bound its meshes' error by (see [`mesh_slack`]).
-pub const VOLUME_TOLERANCE: f64 = 1e-4;
+pub const VOLUME_TOLERANCE: f64 = crate::tolerances::VOLUME_RELATIVE;
 
 /// SolidCraft measures a body from a mesh whose chords keep within this fraction of the body's
 /// size of its faces, and never closer than [`MESH_CHORD_FLOOR`].
-const MESH_CHORD: f64 = 5e-5;
+const MESH_CHORD: f64 = crate::tolerances::MESH_CHORD_RELATIVE;
 
 /// The closest, in millimetres, SolidCraft's measuring mesh keeps to a body's faces.
-const MESH_CHORD_FLOOR: f64 = 1e-4;
+const MESH_CHORD_FLOOR: f64 = crate::tolerances::MESH_CHORD_FLOOR_MM;
+
+/// Position and box allowance: (minimum millimetres, share of the larger diagonal).
+/// Separate evaluations of exact versus imported surfaces differed by at most 0.0022 mm
+/// on a 38 mm helix (5.7e-5 of its size); flat bodies agreed to about 1e-14 mm.
+/// Four mesh chord sags and a 0.01 mm floor leave margin above that measured noise,
+/// while the smallest measured real placement error was 4 mm. The size term is a
+/// conservative allowance for other scales, not a measured scaling law.
+const POSITION_BOX_ALLOWANCE: (f64, f64) = (
+    crate::tolerances::POSITION_MIN_MM,
+    crate::tolerances::POSITION_DIAGONAL_RELATIVE,
+);
 
 /// The relative difference in area at which a replay no longer matches the original. A mesh
 /// misses a curved face's area by about a third of its chord over the face's radius, and
 /// SolidCraft keeps that chord within 3e-4 of the smallest radius: well inside this.
-const AREA_TOLERANCE: f64 = 1e-3;
+const AREA_TOLERANCE: f64 = crate::tolerances::AREA_RELATIVE;
 
 /// How long one SolidCraft evaluation may run before the check gives up.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -41,6 +57,7 @@ pub const CLI_ENV: &str = "SOLIDCRAFT_CLI";
 const CLI_NAME: &str = "solidcraft-cli";
 
 /// How often a running evaluation is polled.
+#[cfg(not(target_family = "wasm"))]
 const POLL: Duration = Duration::from_millis(20);
 
 /// How a written history is checked.
@@ -371,6 +388,15 @@ pub fn chosen_cli(chosen: &Path) -> Result<PathBuf, String> {
     let says_solidcraft = version_of(&cli)?.filter(|line| {
         line.to_ascii_lowercase().contains("solidcraft") && parse_version(line).is_some()
     });
+    if let Some(line) = says_solidcraft.as_deref() {
+        if let Some(oldest) = older_than_supported(line) {
+            return Err(format!(
+                "{line} at {} is older than {oldest}, the oldest Dutchman supports. Choose the \
+                 solidcraft-cli of a newer SolidCraft.",
+                cli.display()
+            ));
+        }
+    }
     match says_solidcraft {
         Some(_) => Ok(cli),
         None => Err(format!(
@@ -384,7 +410,7 @@ pub fn chosen_cli(chosen: &Path) -> Result<PathBuf, String> {
 pub const OLDEST_SOLIDCRAFT: [u64; 3] = [0, 18, 2];
 
 /// The newest minor known at build time. Patch releases need no constant update.
-pub const NEWEST_SOLIDCRAFT: [u64; 2] = [0, 30];
+pub const NEWEST_SOLIDCRAFT: [u64; 2] = [0, 44];
 
 /// The oldest SolidCraft release published in the 14 days before the tag, never below
 /// OLDEST_SOLIDCRAFT. Update alongside NEWEST_SOLIDCRAFT and the CI roundtrip pins at release time.
@@ -393,6 +419,8 @@ pub const WINDOW_OLDEST: [u64; 3] = [0, 18, 2];
 /// Writer capabilities whose output depends on the target release.
 #[derive(Clone, Copy)]
 pub enum VersionGate {
+    /// Sweep paths selected from proven input edges.
+    TopologicalEdges,
     /// Explicit flat tips compensate for changed entry-recess angle handling.
     EntryRecessTip,
     /// Editable sketch-profile coils.
@@ -401,14 +429,26 @@ pub enum VersionGate {
     MirrorChain,
     /// Cone and frustum primitives.
     ConePrimitive,
+    /// Earlier body snapshots used by editable history.
+    HistoryBody,
+    /// Coplanar input faces used as a Split Body tool.
+    SplitFaces,
+    /// Scoped extrude booleans and identities for consumed body results.
+    ScopedBodies,
+    /// Blends selected by a proven closed circular path.
+    ClosedCircleBlend,
 }
 
 impl VersionGate {
     fn minimum(self) -> SolidCraftVersion {
         match self {
+            Self::TopologicalEdges => SolidCraftVersion::V0_44_0,
             Self::EntryRecessTip => SolidCraftVersion::V0_22_1,
             Self::ConePrimitive => SolidCraftVersion::V0_24_1,
+            Self::HistoryBody | Self::SplitFaces => SolidCraftVersion::V0_40_0,
             Self::SketchProfileCoil | Self::MirrorChain => SolidCraftVersion::V0_25_1,
+            Self::ScopedBodies => SolidCraftVersion::V0_44_0,
+            Self::ClosedCircleBlend => SolidCraftVersion::V0_44_1,
         }
     }
 
@@ -420,6 +460,17 @@ impl VersionGate {
 
 /// Whether the writer's release gates can retain less history than the newest target.
 pub fn target_loses_history(target: SolidCraftVersion) -> bool {
+    if [
+        VersionGate::HistoryBody,
+        VersionGate::SplitFaces,
+        VersionGate::ScopedBodies,
+        VersionGate::ClosedCircleBlend,
+    ]
+    .into_iter()
+    .any(|gate| gate.supported(SolidCraftVersion::default()) && !gate.supported(target))
+    {
+        return true;
+    }
     [
         VersionGate::EntryRecessTip,
         VersionGate::SketchProfileCoil,
@@ -464,6 +515,16 @@ pub fn solidcraft_minor(line: &str) -> Option<String> {
 pub struct SolidCraftVersion([u64; 3]);
 
 impl SolidCraftVersion {
+    /// Release used for body-edge sweep paths.
+    /// Also the first release with dimensional 3D sketch wire constraints and scoped extrude booleans.
+    pub const V0_44_0: Self = Self([0, 44, 0]);
+
+    /// Oldest release in the window when history-body and face-tool mapping was added.
+    pub const V0_40_0: Self = Self([0, 40, 0]);
+
+    /// Release used to prove closed circular blend paths.
+    pub const V0_44_1: Self = Self([0, 44, 1]);
+
     /// First release that applies a drill-point angle on counterbores and countersinks.
     pub const V0_22_1: Self = Self([0, 22, 1]);
 
@@ -567,6 +628,18 @@ impl std::fmt::Display for NoCli {
     }
 }
 
+/// "SolidCraft 0.18 patch 2" when a `--version` line names a SolidCraft older than
+/// [`OLDEST_SOLIDCRAFT`], the oldest that opens and checks Dutchman's designs.
+fn older_than_supported(line: &str) -> Option<String> {
+    match parse_version(line) {
+        Some(version) if version < OLDEST_SOLIDCRAFT => {
+            let [major, minor, patch] = OLDEST_SOLIDCRAFT;
+            Some(format!("SolidCraft {major}.{minor} patch {patch}"))
+        }
+        _ => None,
+    }
+}
+
 /// [`find_cli`], refused with the reason when the CLI found says it is older than
 /// [`OLDEST_SOLIDCRAFT`] or macOS blocks it. One that does not say its version is used as it is.
 pub fn usable_cli(verification: &Verification) -> Result<PathBuf, NoCli> {
@@ -574,16 +647,13 @@ pub fn usable_cli(verification: &Verification) -> Result<PathBuf, NoCli> {
     let Some(line) = version_of(&cli).map_err(NoCli::Blocked)? else {
         return Ok(cli);
     };
-    match parse_version(&line) {
-        Some(version) if version < OLDEST_SOLIDCRAFT => {
-            let [major, minor, patch] = OLDEST_SOLIDCRAFT;
-            Err(NoCli::TooOld(format!(
-                "{line} at {} is older than SolidCraft {major}.{minor} patch {patch}, the oldest that \
-                 opens and checks Dutchman's designs; install a newer SolidCraft",
-                cli.display()
-            )))
-        }
-        _ => Ok(cli),
+    match older_than_supported(&line) {
+        Some(oldest) => Err(NoCli::TooOld(format!(
+            "{line} at {} is older than {oldest}, the oldest that opens and checks Dutchman's \
+             designs; install a newer SolidCraft",
+            cli.display()
+        ))),
+        None => Ok(cli),
     }
 }
 
@@ -651,6 +721,7 @@ fn registered() -> Option<PathBuf> {
 /// What `reg.exe query key /v name` (`/ve` for the default value) prints in one registry
 /// view, when it succeeds.
 #[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(not(target_family = "wasm"))]
 fn reg_query(key: &str, name: &str, view: &str) -> Option<String> {
     #[cfg(windows)]
     {
@@ -809,12 +880,14 @@ fn bundle_version(app: &Path) -> Vec<u64> {
 
 /// The version the SolidCraft CLI `verification` finds prints (`solidcraft-cli 0.18.2`),
 /// when there is one and it answers within a few seconds.
+#[cfg(not(target_family = "wasm"))]
 pub fn solidcraft_version(verification: &Verification) -> Option<String> {
     version_of(&find_cli(verification).ok()?).ok().flatten()
 }
 
 /// Return a previously discovered CLI version without starting the CLI.
 /// Consults both the process cache and the executable's matching disk cache entry.
+#[cfg(not(target_family = "wasm"))]
 pub fn cached_solidcraft_version(verification: &Verification) -> Option<String> {
     version_cache::version(&find_cli(verification).ok()?, false)
         .ok()
@@ -822,13 +895,16 @@ pub fn cached_solidcraft_version(verification: &Verification) -> Option<String> 
 }
 
 /// How many times to try running a CLI the system says is busy being written.
+#[cfg(not(target_family = "wasm"))]
 const BUSY_TRIES: u32 = 50;
 
 /// The first line `cli --version` prints, when it answers within a few seconds.
+#[cfg(not(target_family = "wasm"))]
 fn version_of(cli: &Path) -> Result<Option<String>, String> {
     version_cache::version(cli, true)
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn probe_version(cli: &Path) -> Result<Option<(String, bool)>, String> {
     let mut child = match spawn(cli, |command| {
         command
@@ -897,6 +973,7 @@ fn quarantine_blocks(value: &str) -> bool {
         && u16::from_str_radix(flags, 16).is_ok_and(|flags| flags & 0x0040 == 0)
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn blocked_failure(cli: &Path) -> Option<String> {
     #[cfg(target_os = "macos")]
     {
@@ -921,6 +998,7 @@ fn blocked_failure(cli: &Path) -> Option<String> {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn launch_failure(cli: &Path, err: std::io::Error) -> String {
     blocked_failure(cli).unwrap_or_else(|| format!("cannot run {}: {err}", cli.display()))
 }
@@ -938,7 +1016,7 @@ fn newest_cli(
 /// with, and a replay that runs is kept unverified, saying why.
 #[cfg(all(test, unix))]
 pub(crate) fn compare(
-    cli: &Path,
+    cli: &(impl SolidCraftEvaluator + ?Sized),
     timeout: Duration,
     history: &[u8],
     original: &[u8],
@@ -957,7 +1035,7 @@ pub(crate) fn compare(
 }
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compare_with_progress(
-    cli: &Path,
+    cli: &(impl SolidCraftEvaluator + ?Sized),
     timeout: Duration,
     history: &[u8],
     original: &[u8],
@@ -966,7 +1044,57 @@ pub(crate) fn compare_with_progress(
     part: &str,
     consequence: &str,
 ) -> Outcome {
-    let evaluate = |cli: &Path, timeout: Duration, dir: &Path, name: &str, design: &[u8]| {
+    compare_measurements(
+        cli,
+        timeout,
+        history,
+        original,
+        bodies,
+        progress,
+        part,
+        consequence,
+        false,
+    )
+}
+
+/// New inference needs every body measurement; ordinary replay retains its permissive policy.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compare_complete(
+    cli: &(impl SolidCraftEvaluator + ?Sized),
+    timeout: Duration,
+    history: &[u8],
+    original: &[u8],
+    bodies: Expected,
+    progress: Option<&dutchman_core::Progress<'_>>,
+    part: &str,
+    consequence: &str,
+) -> Outcome {
+    compare_measurements(
+        cli,
+        timeout,
+        history,
+        original,
+        bodies,
+        progress,
+        part,
+        consequence,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compare_measurements(
+    cli: &(impl SolidCraftEvaluator + ?Sized),
+    timeout: Duration,
+    history: &[u8],
+    original: &[u8],
+    bodies: Expected,
+    progress: Option<&dutchman_core::Progress<'_>>,
+    part: &str,
+    consequence: &str,
+    complete: bool,
+) -> Outcome {
+    let evaluate = |timeout: Duration, name: &str, design: &[u8]| {
         let _checking = progress.map(|p| {
             p.step(
                 if name == "original" {
@@ -979,19 +1107,15 @@ pub(crate) fn compare_with_progress(
                 Some(consequence),
             )
         });
-        evaluate(cli, timeout, dir, name, design)
+        evaluate(cli, timeout, name, design)
     };
-    let dir = match tempfile::tempdir() {
-        Ok(dir) => dir,
-        Err(err) => return Outcome::Unverified(format!("no scratch folder: {err}")),
-    };
-    let expected = match evaluate(cli, timeout, dir.path(), "original", original) {
+    let expected = match evaluate(timeout, "original", original) {
         Ok(Evaluation::Done(eval)) => eval,
         Ok(Evaluation::Failed(why)) | Err(why) => {
             return Outcome::Unverified(format!("cannot evaluate the original geometry: {why}"))
         }
     };
-    let replayed = match evaluate(cli, timeout, dir.path(), "history", history) {
+    let replayed = match evaluate(timeout, "history", history) {
         Ok(Evaluation::Done(eval)) => eval,
         Ok(Evaluation::Failed(why)) => {
             return Outcome::Differs(format!("SolidCraft cannot replay it: {why}"))
@@ -1008,27 +1132,22 @@ pub(crate) fn compare_with_progress(
             unsound.join("; ")
         ));
     }
-    match_bodies(&replayed.bodies, &expected.bodies)
+    if complete {
+        match_complete_bodies(&replayed.bodies, &expected.bodies)
+    } else {
+        match_bodies(&replayed.bodies, &expected.bodies)
+    }
 }
 
 /// Checks that retained features replay, without comparing an unfinished body to the final one.
 ///
 /// Also says where the replay's bodies are, when it replayed.
 pub(crate) fn replay(
-    cli: &Path,
+    cli: &(impl SolidCraftEvaluator + ?Sized),
     timeout: Duration,
     design: &[u8],
 ) -> (Outcome, Option<Vec<Placed>>) {
-    let dir = match tempfile::tempdir() {
-        Ok(dir) => dir,
-        Err(err) => {
-            return (
-                Outcome::Unverified(format!("no scratch folder: {err}")),
-                None,
-            )
-        }
-    };
-    match evaluate(cli, timeout, dir.path(), "prefix", design) {
+    match evaluate(cli, timeout, "prefix", design) {
         Ok(Evaluation::Done(eval)) => match eval.errors.first() {
             Some(why) => (Outcome::Differs(why.clone()), None),
             None => {
@@ -1048,6 +1167,75 @@ pub(crate) fn replay(
     }
 }
 
+/// The source's solid and a candidate's replay compared directly in one SolidCraft session:
+/// the largest distance between their surfaces and each one's face count.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Deviation {
+    /// The largest distance (mm) from either surface to the other.
+    pub max: f64,
+    /// The diagonal (mm) of the source solid's box.
+    pub size: f64,
+    /// Faces of the replayed body, then of the source's.
+    pub faces: Option<(usize, usize)>,
+}
+
+impl Deviation {
+    /// Whether the surfaces agree within the allowance the box comparison gives a body's
+    /// extremes, which are points on its surface: 0.01 mm, or two meshes' chords of its size.
+    pub(crate) fn within(&self) -> bool {
+        let (minimum, share) = POSITION_BOX_ALLOWANCE;
+        within(self.max, (share * self.size).max(minimum))
+    }
+}
+
+/// Samples per comparison, at most: SolidCraft coarsens its spacing for larger surfaces, so a
+/// large body costs no more than this.
+const DEVIATION_POINTS: u64 = 200_000;
+
+/// Loads the source's solid (the Import `original`, suppressed in `design`) beside the replayed
+/// history, which must hold the design's only other body, and compares the two. `None` when
+/// that cannot be done: more bodies than two, a host without the command, a timeout.
+pub(crate) fn deviation(
+    cli: &(impl SolidCraftEvaluator + ?Sized),
+    timeout: Duration,
+    design: &[u8],
+    original: u64,
+) -> Option<Deviation> {
+    let script = [
+        serde_json::json!({"command": "timeline.suppress", "params": {"feature": original, "suppressed": false}}),
+        serde_json::json!({"command": "inspect.compare", "params": {"tolerance": 0.001, "max_points": DEVIATION_POINTS}}),
+    ];
+    let results = cli.run(design, &script, timeout, "deviation").ok()?;
+    let compared = results.get(1)?;
+    let max = compared.pointer("/deviation/max_mm")?.as_f64()?;
+    let corner = |end: &str| -> Option<Vec<f64>> {
+        compared
+            .pointer(&format!("/b/bbox/{end}"))?
+            .as_array()?
+            .iter()
+            .map(Value::as_f64)
+            .collect()
+    };
+    let (low, high) = (corner("min")?, corner("max")?);
+    let size = low
+        .iter()
+        .zip(&high)
+        .map(|(a, b)| (b - a) * (b - a))
+        .sum::<f64>()
+        .sqrt();
+    let faces = |side: &str| {
+        compared
+            .pointer(&format!("/{side}/faces"))
+            .and_then(Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok())
+    };
+    (max.is_finite() && size.is_finite() && low.len() == 3).then_some(Deviation {
+        max,
+        size,
+        faces: faces("a").zip(faces("b")),
+    })
+}
+
 /// Where a replayed body is: the centre and diagonal of its box, when SolidCraft gives them.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Placed {
@@ -1063,14 +1251,19 @@ pub(crate) struct StoredBody {
     pub exact: bool,
 }
 
+// (Minimum millimetres, share of the replayed box diagonal). A box over the body's own
+// edge vertices, interior samples and proven arc extremes can only miss an extreme inside
+// a face or between samples. For the parts this checks, that moves the centre by a small
+// fraction of the size, never by a large share of it.
+const APPROXIMATE_BODY_CENTER_TOLERANCE: (f64, f64) = crate::tolerances::STORED_SAMPLED;
+
 /// What to say when a replayed partial history doesn't hold the bodies the source stores at
 /// the same point (`stored`): fewer bodies, or a stored body with no replayed body whose box
 /// centre is near enough. An exact stored box is the solid's own, so its centre must be within
-/// 0.5 mm or 1% of the replayed body's box diagonal. Any other is taken over points sampled on
-/// each edge, which can bunch on a curve, so its centre can be off by up to the body's radius:
-/// half the diagonal (at least 0.5 mm), as far as a replayed body of the right size can be. The
-/// source's list can leave bodies out, so a replay with more bodies than it lists isn't a
-/// difference.
+/// the larger of 0.5 mm and 1% of the replayed body's box diagonal. A box over edge vertices,
+/// interior samples and proven arc extremes allows the larger of 1 mm and 2% of that diagonal.
+/// The source's list can leave bodies out, so a replay with more bodies than it lists isn't
+/// a difference.
 pub(crate) fn bodies_differ(
     stored: Option<&[StoredBody]>,
     replayed: Option<&[Placed]>,
@@ -1096,11 +1289,21 @@ pub(crate) fn bodies_differ(
             .sqrt()
     };
     for body in stored {
-        let share = if body.exact { 0.01 } else { 0.5 };
+        let (minimum, share) = if body.exact {
+            crate::tolerances::STORED_EXACT
+        } else {
+            APPROXIMATE_BODY_CENTER_TOLERANCE
+        };
         let nearest = free
             .iter()
             .enumerate()
-            .map(|(slot, (at, size))| (slot, distance(&body.center, at), (size * share).max(0.5)))
+            .map(|(slot, (at, size))| {
+                (
+                    slot,
+                    distance(&body.center, at),
+                    (size * share).max(minimum),
+                )
+            })
             .min_by(|a, b| a.1.total_cmp(&b.1))?;
         if nearest.1 > nearest.2 {
             return Some(format!(
@@ -1116,9 +1319,10 @@ pub(crate) fn bodies_differ(
 /// What is wrong with a design's body `volumes` in SolidCraft, for a design with
 /// `bodies.solids` solid bodies (0: not counted): bodies inside out, and solids without a volume.
 ///
-/// A sheet body bounds no volume, but SolidCraft gives it one, of either sign, and does not
-/// say which of its bodies are sheets. So as many bodies inside out as the design has sheets
-/// are taken for them, and only the rest are reported.
+/// A sheet body bounds no volume. SolidCraft 0.23 and newer give it none (read as zero); older
+/// releases give it one, of either sign, and do not say which of its bodies are sheets. So as
+/// many bodies inside out as the design has sheets are taken for them, and only the rest are
+/// reported.
 fn volume_problems(volumes: &[f64], bodies: Expected) -> Vec<String> {
     let solids = bodies.solids;
     let mut problems = Vec::new();
@@ -1167,19 +1371,15 @@ pub(crate) struct Expected {
 }
 
 /// A body volume, in cubic millimetres, below which SolidCraft gives the body none.
-const NO_VOLUME: f64 = 1e-6;
+const NO_VOLUME: f64 = crate::tolerances::NO_VOLUME_MM3;
 
 pub(crate) fn check_import(
-    cli: &Path,
+    cli: &(impl SolidCraftEvaluator + ?Sized),
     timeout: Duration,
     design: &[u8],
     expected: Expected,
 ) -> Shown {
-    let dir = match tempfile::tempdir() {
-        Ok(dir) => dir,
-        Err(err) => return Shown::Unchecked(format!("no scratch folder: {err}")),
-    };
-    let eval = match evaluate(cli, timeout, dir.path(), "import", design) {
+    let eval = match evaluate(cli, timeout, "import", design) {
         Ok(Evaluation::Done(eval)) => eval,
         Ok(Evaluation::Failed(why)) => {
             return Shown::Short(format!("SolidCraft cannot open it: {why}"))
@@ -1216,8 +1416,38 @@ fn shown(eval: &Eval, expected: Expected) -> Shown {
     }
 }
 
-/// Whether two sets of bodies match, regardless of body order: in volume, within what
-/// SolidCraft's measuring meshes can miss, and in area.
+/// Require finite, complete measurements of every source and replayed body for new inference.
+/// Keep `match_bodies` permissive for existing replay checks and the earlier two readings.
+fn match_complete_bodies(replayed: &[Measured], expected: &[Measured]) -> Outcome {
+    let complete = |body: &Measured| {
+        body.volume.is_finite()
+            && body
+                .area
+                .is_some_and(|area| area.is_finite() && area >= 0.0)
+            && body
+                .size
+                .is_some_and(|size| size.is_finite() && size >= 0.0)
+            && body
+                .center
+                .is_some_and(|at| at.iter().all(|v| v.is_finite()))
+            && body.bounds.is_some_and(|(min, max)| {
+                min.iter()
+                    .zip(max)
+                    .all(|(lo, hi)| lo.is_finite() && hi.is_finite() && *lo <= hi)
+            })
+    };
+    if replayed.is_empty() || expected.is_empty() || !replayed.iter().chain(expected).all(complete)
+    {
+        return Outcome::Unverified(
+            "inference requires finite volume, area, complete bounds and placement for every body"
+                .to_owned(),
+        );
+    }
+    match_bodies(replayed, expected)
+}
+
+/// Whether two sets of bodies match, regardless of body order: in position and box,
+/// volume, and area, within what SolidCraft's measuring meshes can miss.
 fn match_bodies(replayed: &[Measured], expected: &[Measured]) -> Outcome {
     if replayed.len() != expected.len() {
         return Outcome::Differs(format!(
@@ -1227,10 +1457,60 @@ fn match_bodies(replayed: &[Measured], expected: &[Measured]) -> Outcome {
         ));
     }
     let mut replayed = replayed.to_vec();
-    let mut expected = expected.to_vec();
-    replayed.sort_by(|a, b| a.volume.total_cmp(&b.volume));
-    expected.sort_by(|a, b| a.volume.total_cmp(&b.volume));
-    for (got, want) in replayed.iter().zip(&expected) {
+    for want in expected {
+        let distance = |got: &Measured| {
+            got.center
+                .zip(want.center)
+                .map_or(f64::INFINITY, |(a, b)| center_distance(&a, &b))
+        };
+        let nearest = replayed.iter().enumerate().min_by(|(_, a), (_, b)| {
+            distance(a).total_cmp(&distance(b)).then_with(|| {
+                (a.volume - want.volume)
+                    .abs()
+                    .total_cmp(&(b.volume - want.volume).abs())
+            })
+        });
+        let Some((index, _)) = nearest else {
+            // The count check ensures an unpaired body for every original.
+            break;
+        };
+        let got = replayed.remove(index);
+        let got = &got;
+        if let (
+            Some((min_a, max_a)),
+            Some((min_b, max_b)),
+            Some(at),
+            Some(to),
+            Some(sa),
+            Some(sb),
+        ) = (
+            got.bounds,
+            want.bounds,
+            got.center,
+            want.center,
+            got.size,
+            want.size,
+        ) {
+            let (minimum, share) = POSITION_BOX_ALLOWANCE;
+            let allowed = (share * sa.max(sb)).max(minimum);
+            let shift = center_distance(&at, &to);
+            if !within(shift, allowed) {
+                return Outcome::Differs(format!(
+                    "a body sits {shift:.3} mm from the original's position"
+                ));
+            }
+            let difference = min_a
+                .iter()
+                .chain(&max_a)
+                .zip(min_b.iter().chain(&max_b))
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f64::max);
+            if !within(difference, allowed) {
+                return Outcome::Differs(format!(
+                    "a body's box differs from the original's by {difference:.3} mm"
+                ));
+            }
+        }
         let (v, w) = (got.volume, want.volume);
         let allowed = (VOLUME_TOLERANCE * v.abs().max(w.abs())).max(mesh_slack(got, want));
         if !within((v - w).abs(), allowed) {
@@ -1247,6 +1527,14 @@ fn match_bodies(replayed: &[Measured], expected: &[Measured]) -> Outcome {
         }
     }
     Outcome::Matches
+}
+
+fn center_distance(a: &[f64; 3], b: &[f64; 3]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(a, b)| (a - b).powi(2))
+        .sum::<f64>()
+        .sqrt()
 }
 
 /// Whether `difference` is no more than `limit`; not when either is not a number.
@@ -1277,6 +1565,8 @@ struct Measured {
     size: Option<f64>,
     /// The centre of its box, when SolidCraft gives it.
     center: Option<[f64; 3]>,
+    /// The minimum and maximum corners of its box, when SolidCraft gives it.
+    bounds: Option<([f64; 3], [f64; 3])>,
 }
 
 /// One design as SolidCraft evaluated it.
@@ -1301,19 +1591,19 @@ enum Evaluation {
 
 /// Evaluates `design` with the CLI. `Err` when the CLI could not give an answer at all.
 fn evaluate(
-    cli: &Path,
+    cli: &(impl SolidCraftEvaluator + ?Sized),
     timeout: Duration,
-    dir: &Path,
     name: &str,
     design: &[u8],
 ) -> Result<Evaluation, String> {
-    let value = evaluate_json(cli, timeout, dir, name, design)?;
+    let value = cli.evaluate(design, timeout, name)?;
     if let Some(why) = value.get("evaluation_failed").and_then(Value::as_str) {
         return Ok(Evaluation::Failed(why.to_owned()));
     }
     parse(&value).map(Evaluation::Done)
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn evaluate_json(
     cli: &Path,
     timeout: Duration,
@@ -1384,7 +1674,8 @@ pub(crate) fn evaluate_json(
 }
 
 /// One edge of a body SolidCraft replayed, as `model.edges` gives it: its end vertices, the
-/// point halfway along it and its length, in millimetres. It gives no carrier or tangent.
+/// point halfway along it and its length, in millimetres. Circular carriers are measured
+/// separately when a closed blend requests them; ordinary edge/face proofs need no carrier.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ReplayedEdge {
     pub start: [f64; 3],
@@ -1393,6 +1684,20 @@ pub(crate) struct ReplayedEdge {
     pub length: f64,
     /// SolidCraft's name for it: the names of the faces it joins, separated by `|`.
     pub name: String,
+    /// The index reported in this replay, used only for its carrier measurement.
+    pub index: Option<usize>,
+    /// Circular carrier confirmed by an additional edge measurement, when requested.
+    pub circle: Option<ReplayedCircle>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ReplayedCircle {
+    pub center: [f64; 3],
+    pub axis: [f64; 3],
+    pub radius: f64,
+    pub length: f64,
+    /// Measure can combine several pieces into their complete circular rim.
+    pub whole: bool,
 }
 
 /// One face of a body SolidCraft replayed, as `model.faces` gives it. `normal` is the
@@ -1423,25 +1728,29 @@ const REPLAY_EDGES: usize = 200_000;
 /// Replays `design` in SolidCraft and reports the bodies and their edges with the timeline
 /// rolled to just after each feature id in `after` (in that order): the bodies each later
 /// feature starts from. Two runs of the CLI in all, however many steps, within `timeout`
-/// together: one finds the bodies at every step, the next their edges. Each step is `Err`
+/// together: one finds the bodies at every step, the next their edges. Closed circles
+/// optionally request a third pass for circular carriers within the same deadline. Each step is `Err`
 /// when a feature before it fails there; the whole is `Err` when SolidCraft gives no answer.
 pub(crate) fn replay_edges(
-    cli: &Path,
+    cli: &(impl SolidCraftEvaluator + ?Sized),
     timeout: Duration,
     design: &[u8],
     after: &[u64],
     faces: bool,
+    circles: bool,
 ) -> Result<Vec<Result<Replay, String>>, String> {
     let deadline = Instant::now() + timeout;
-    let dir = tempfile::tempdir().map_err(|err| format!("no scratch folder: {err}"))?;
-    let input = dir.path().join("history.solidcraft");
-    std::fs::write(&input, design).map_err(|err| format!("cannot stage the design: {err}"))?;
     let roll = |id: u64| crate::replay::roll_commands(id)[0].clone();
     let mut script = Vec::new();
     for id in after {
         script.extend(crate::replay::roll_commands(*id));
     }
-    let results = run_script(cli, deadline, dir.path(), "bodies", &input, &script)?;
+    let results = cli.run(
+        design,
+        &script,
+        deadline.saturating_duration_since(Instant::now()),
+        "bodies",
+    )?;
     let mut steps = Vec::new();
     for (k, _) in after.iter().enumerate() {
         let inspect = results
@@ -1467,7 +1776,12 @@ pub(crate) fn replay_edges(
             }
         }
     }
-    let results = run_script(cli, deadline, dir.path(), "edges", &input, &script)?;
+    let results = cli.run(
+        design,
+        &script,
+        deadline.saturating_duration_since(Instant::now()),
+        "edges",
+    )?;
     let mut at = 0usize;
     for step in &mut steps {
         at = at.saturating_add(1);
@@ -1514,7 +1828,108 @@ pub(crate) fn replay_edges(
             }
         }
     }
+    if circles {
+        measure_circles(cli, deadline, design, after, &mut steps);
+    }
     Ok(steps)
+}
+
+/// This optional pass must not discard the existing edge/face proof when an evaluator
+/// cannot measure circular carriers. Only the new closed-circle proof then refuses.
+fn measure_circles(
+    cli: &(impl SolidCraftEvaluator + ?Sized),
+    deadline: Instant,
+    design: &[u8],
+    after: &[u64],
+    steps: &mut [Result<Replay, String>],
+) {
+    let mut script = Vec::new();
+    let mut locations = Vec::new();
+    for (s, (id, step)) in after.iter().zip(steps.iter()).enumerate() {
+        let Ok(replay) = step else { continue };
+        let [roll, _] = crate::replay::roll_commands(*id);
+        script.push(roll);
+        for (b, (name, edges)) in replay.bodies.iter().enumerate() {
+            for (e, edge) in edges.iter().enumerate() {
+                let Some(index) = edge.index else { continue };
+                if locations.len() >= REPLAY_EDGES {
+                    return;
+                }
+                locations.push((s, b, e, script.len()));
+                script.push(serde_json::json!({"command": "inspect.measure", "params": {
+                    "items": [{"type": "edge", "body": name, "index": index, "point": edge.mid}]
+                }}));
+            }
+        }
+    }
+    if locations.is_empty() {
+        return;
+    }
+    let Ok(results) = cli.run(
+        design,
+        &script,
+        deadline.saturating_duration_since(Instant::now()),
+        "circle carriers",
+    ) else {
+        return;
+    };
+    for (s, b, e, at) in locations {
+        let circle = results.get(at).and_then(replayed_circle);
+        if let Some(edge) = steps
+            .get_mut(s)
+            .and_then(|step| step.as_mut().ok())
+            .and_then(|step| step.bodies.get_mut(b))
+            .and_then(|(_, edges)| edges.get_mut(e))
+        {
+            edge.circle = circle;
+        }
+    }
+}
+
+fn replayed_circle(row: &Value) -> Option<ReplayedCircle> {
+    let [item] = row.get("items")?.as_array()?.as_slice() else {
+        return None;
+    };
+    if item.get("type")?.as_str()? != "edge" {
+        return None;
+    }
+    let whole = match item.get("round")?.as_str()? {
+        "circle" => true,
+        "arc" => false,
+        _ => return None,
+    };
+    let number = |key| item.get(key)?.as_f64().filter(|value| value.is_finite());
+    let radius = number("radius").filter(|radius| *radius > 0.0)?;
+    let length = number("length_mm").filter(|length| *length > 0.0)?;
+    let analytic_length = number(if whole { "circumference" } else { "arc_length" })?;
+    if length.to_bits() != analytic_length.to_bits() {
+        // A fitted mesh circle reports its polygon length, whereas an exact circle's
+        // length and circumference are the same radius-times-turn calculation in 0.44.1.
+        return None;
+    }
+    let point = |key| -> Option<[f64; 3]> {
+        let values = item.get(key)?.as_array()?;
+        if values.len() != 3 {
+            return None;
+        }
+        let mut out = [0.0; 3];
+        for (slot, value) in out.iter_mut().zip(values) {
+            *slot = value.as_f64().filter(|value| value.is_finite())?;
+        }
+        Some(out)
+    };
+    let axis = point("axis")?;
+    let norm = axis.iter().map(|value| value * value).sum::<f64>().sqrt();
+    if !norm.is_finite() || norm <= 0.0 {
+        return None;
+    }
+    Some(ReplayedCircle {
+        center: point("center")?,
+        axis: axis.map(|value| value / norm),
+        radius,
+        length,
+        whole,
+    })
 }
 
 /// The bodies a `document.inspect` result holds, or the first feature still active that
@@ -1607,11 +2022,17 @@ fn edge_fields(row: &Value) -> Option<ReplayedEdge> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
+        index: row
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok()),
+        circle: None,
     })
 }
 
 /// Runs `script` on `design` with the CLI and returns its per-command results.
-fn run_script(
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn run_script(
     cli: &Path,
     deadline: Instant,
     dir: &Path,
@@ -1659,6 +2080,7 @@ fn run_script(
 /// Keeps a console program this one starts from opening a window of its own, as it does when
 /// this one has no console: the desktop app, and the children it converts in. Attached to a
 /// terminal it shares that one, where Ctrl+C reaches it.
+#[cfg(not(target_family = "wasm"))]
 pub fn hide_console(command: &mut Command) {
     #[cfg(windows)]
     {
@@ -1673,6 +2095,7 @@ pub fn hide_console(command: &mut Command) {
     let _ = command;
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn spawn(
     cli: &Path,
     configure: impl Fn(&mut Command),
@@ -1696,30 +2119,37 @@ pub(crate) fn spawn(
 
 /// Free memory below which a SolidCraft check stops and the design is kept unverified. Above
 /// the floor where a conversion itself stops, so a built design is never lost to its check.
+#[cfg(not(target_family = "wasm"))]
 const CHECK_MEMORY_FLOOR: u64 = 3 << 29;
 
 /// Why a check stopped for memory.
+#[cfg(not(target_family = "wasm"))]
 const CHECK_STOPPED_FOR_MEMORY: &str =
     "History check stopped: the computer was running low on memory";
 
 /// Set once a check stops for memory: the checks after it would only run out again.
+#[cfg(not(target_family = "wasm"))]
 static CHECKS_STOPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether checks watch memory at all: on unless memory checks are turned off for the run.
+#[cfg(not(target_family = "wasm"))]
 static CHECKS_WATCH_MEMORY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Turns the memory watch on running checks on or off, for this run.
+#[cfg(not(target_family = "wasm"))]
 pub fn watch_check_memory(on: bool) {
     CHECKS_WATCH_MEMORY.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether this much free memory is too little for a check to carry on.
+#[cfg(not(target_family = "wasm"))]
 fn below_check_floor(available: Option<u64>) -> bool {
     available.is_some_and(|free| free < CHECK_MEMORY_FLOOR)
 }
 
 /// Whether a running check should stop for memory, measuring it now.
+#[cfg(not(target_family = "wasm"))]
 fn check_must_stop() -> bool {
     use std::sync::atomic::Ordering;
     #[cfg(debug_assertions)]
@@ -1742,6 +2172,7 @@ fn check_must_stop() -> bool {
 }
 
 /// Waits for `child` until `deadline`, killing it then.
+#[cfg(not(target_family = "wasm"))]
 fn wait(
     child: &mut std::process::Child,
     cli: &Path,
@@ -1780,23 +2211,29 @@ fn parse(value: &Value) -> Result<Eval, String> {
     let bodies = bodies
         .iter()
         .map(|body| {
-            let volume = body
-                .get("volume_mm3")
-                .and_then(Value::as_f64)
-                .ok_or_else(|| format!("{CLI_NAME} result has a body without a volume"))?;
-            let corner = |end: &str| -> Option<Vec<f64>> {
+            // SolidCraft 0.23 and newer give an open body no volume: it bounds none.
+            let volume = match body.get("volume_mm3") {
+                None | Some(Value::Null) => 0.0,
+                Some(volume) => volume
+                    .as_f64()
+                    .ok_or_else(|| format!("{CLI_NAME} result has a malformed body volume"))?,
+            };
+            let corner = |end: &str| -> Option<[f64; 3]> {
                 let corner = body.pointer(&format!("/bbox/{end}"))?.as_array()?;
                 let corner: Option<Vec<f64>> = corner.iter().map(Value::as_f64).collect();
-                corner.filter(|corner| corner.len() == 3)
+                <[f64; 3]>::try_from(corner?)
+                    .ok()
+                    .filter(|corner| corner.iter().all(|v| v.is_finite()))
             };
-            let size = corner("min").zip(corner("max")).map(|(min, max)| {
+            let bounds = corner("min").zip(corner("max"));
+            let size = bounds.map(|(min, max)| {
                 min.iter()
                     .zip(&max)
                     .map(|(lo, hi)| (hi - lo) * (hi - lo))
                     .sum::<f64>()
                     .sqrt()
             });
-            let center = corner("min").zip(corner("max")).and_then(|(min, max)| {
+            let center = bounds.and_then(|(min, max)| {
                 let center: Vec<f64> = min
                     .iter()
                     .zip(&max)
@@ -1811,6 +2248,7 @@ fn parse(value: &Value) -> Result<Eval, String> {
                 area: body.get("area_mm2").and_then(Value::as_f64),
                 size: size.filter(|size| size.is_finite()),
                 center,
+                bounds,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -1840,6 +2278,29 @@ fn parse(value: &Value) -> Result<Eval, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn circular_edge_measurements_require_the_plane_and_an_analytic_length() {
+        let full = 10.0 * std::f64::consts::PI;
+        let mut row = serde_json::json!({"items": [{"type": "edge", "round": "circle",
+            "center": [0,0,10], "axis": [0,0,1], "radius": 5.0,
+            "length_mm": full, "circumference": full}]});
+        let circle = super::replayed_circle(&row).unwrap();
+        assert_eq!(circle.center, [0.0, 0.0, 10.0]);
+        assert_eq!(circle.axis, [0.0, 0.0, 1.0]);
+        assert!(circle.whole);
+        // Measured in the 0.44.1 cylinder probe: a fitted mesh must not certify a circle.
+        row["items"][0]["length_mm"] = serde_json::json!(31.365175761189757);
+        assert!(super::replayed_circle(&row).is_none());
+        row["items"][0]["length_mm"] = serde_json::json!(full);
+        row["items"][0]["axis"] = serde_json::Value::Null;
+        assert!(super::replayed_circle(&row).is_none());
+        row["items"][0]["axis"] = serde_json::json!([0, 0, 0]);
+        assert!(super::replayed_circle(&row).is_none());
+        row["items"][0]["axis"] = serde_json::json!([0, 0, 1]);
+        row["items"][0]["round"] = serde_json::json!("cylinder");
+        assert!(super::replayed_circle(&row).is_none());
+    }
+
     use super::*;
 
     #[test]
@@ -1880,13 +2341,15 @@ mod tests {
             bodies_differ(Some(&one), Some(&[piece])).as_deref(),
             Some("a retained body sits 12.6 mm from where the source has it at the same point")
         );
-        // Within half the body's size, as far as a full circle's samples can put the stored
-        // centre: the same body.
+        // An approximate stored centre must also be close to the replayed centre.
         let near = Placed {
             center: Some([0.0, 26.0, 1.5]),
             size: Some(30.0),
         };
-        assert_eq!(bodies_differ(Some(&one), Some(&[near])), None);
+        assert_eq!(
+            bodies_differ(Some(&one), Some(&[near])).as_deref(),
+            Some("a retained body sits 13.8 mm from where the source has it at the same point")
+        );
         // An exact stored box is the solid's own: the same 13.8 mm is a different body, and
         // only a centre within 1% of the size (at least 0.5 mm) matches.
         let exact = [StoredBody {
@@ -1917,6 +2380,25 @@ mod tests {
             size: None,
         };
         assert_eq!(bodies_differ(Some(&one), Some(&[unknown])), None);
+    }
+
+    #[test]
+    fn approximate_stored_centres_allow_small_offsets_but_not_a_large_share_of_the_body() {
+        let stored = [StoredBody {
+            center: [0.0; 3],
+            exact: false,
+        }];
+        let replayed = |offset: f64| {
+            [Placed {
+                center: Some([offset, 0.0, 0.0]),
+                size: Some(56.0),
+            }]
+        };
+        assert_eq!(
+            bodies_differ(Some(&stored), Some(&replayed(17.7))).as_deref(),
+            Some("a retained body sits 17.7 mm from where the source has it at the same point")
+        );
+        assert_eq!(bodies_differ(Some(&stored), Some(&replayed(0.8))), None);
     }
 
     fn touch(folder: &Path, name: &str) -> PathBuf {
@@ -2181,6 +2663,7 @@ mod tests {
                 area: None,
                 size: None,
                 center: None,
+                bounds: None,
             })
             .collect()
     }
@@ -2191,7 +2674,211 @@ mod tests {
             area: Some(area),
             size: Some(size),
             center: None,
+            bounds: None,
         }]
+    }
+
+    fn boxed(min: [f64; 3], max: [f64; 3]) -> Measured {
+        parse(&serde_json::json!({
+            "bodies": [{
+                "volume_mm3": 6000.0, "area_mm2": 2200.0,
+                "bbox": {"min": min, "max": max}
+            }]
+        }))
+        .unwrap()
+        .bodies
+        .remove(0)
+    }
+
+    #[test]
+    fn new_inference_requires_complete_finite_measurements_on_every_body() {
+        let complete = boxed([0.0; 3], [10.0; 3]);
+        assert_eq!(
+            match_complete_bodies(
+                std::slice::from_ref(&complete),
+                std::slice::from_ref(&complete)
+            ),
+            Outcome::Matches
+        );
+        let mut missing = Vec::new();
+        for field in 0..10 {
+            let mut body = complete.clone();
+            match field {
+                0 => body.volume = f64::INFINITY,
+                1 => body.area = None,
+                2 => body.bounds = None,
+                3 => body.center = None,
+                4 => body.size = None,
+                5 => body.area = Some(f64::NAN),
+                6 => body.size = Some(f64::INFINITY),
+                7 => body.center = Some([f64::NAN; 3]),
+                8 => body.bounds = Some(([f64::NEG_INFINITY; 3], [10.0; 3])),
+                _ => body.bounds = Some(([10.0; 3], [0.0; 3])),
+            }
+            missing.push(body);
+        }
+        for body in &missing {
+            for (replay, source) in [(body, &complete), (&complete, body)] {
+                assert!(
+                    matches!(
+                        match_complete_bodies(
+                            std::slice::from_ref(replay),
+                            std::slice::from_ref(source)
+                        ),
+                        Outcome::Unverified(_)
+                    ),
+                    "{body:?}"
+                );
+            }
+        }
+        // Complete measurements are required for every body, not just the first pair.
+        assert!(matches!(
+            match_complete_bodies(
+                &[complete.clone(), missing[1].clone()],
+                &[complete.clone(), complete.clone()]
+            ),
+            Outcome::Unverified(_)
+        ));
+        // The ordinary comparison still deliberately accepts missing box and area.
+        let mut body = complete.clone();
+        body.area = None;
+        body.bounds = None;
+        body.center = None;
+        body.size = None;
+        assert_eq!(
+            match_bodies(std::slice::from_ref(&body), std::slice::from_ref(&complete)),
+            Outcome::Matches
+        );
+        assert_eq!(
+            match_bodies(std::slice::from_ref(&complete), std::slice::from_ref(&body)),
+            Outcome::Matches
+        );
+    }
+
+    #[test]
+    fn a_body_shifted_with_the_same_volume_and_area_differs() {
+        let original = boxed([0.0; 3], [10.0; 3]);
+        let shifted = boxed([0.0, 6.0, 0.0], [10.0, 16.0, 10.0]);
+        assert_eq!(
+            match_bodies(&[shifted], &[original]),
+            Outcome::Differs("a body sits 6.000 mm from the original's position".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_body_with_swapped_extents_at_the_same_center_differs() {
+        let original = boxed([-5.0, -10.0, -15.0], [5.0, 10.0, 15.0]);
+        let turned = boxed([-5.0, -15.0, -10.0], [5.0, 15.0, 10.0]);
+        assert_eq!(
+            match_bodies(&[turned], &[original]),
+            Outcome::Differs("a body's box differs from the original's by 5.000 mm".to_owned())
+        );
+    }
+
+    #[test]
+    fn boxes_match_within_the_position_allowance_and_floor() {
+        for size in [0.01, 30.0] {
+            let original = boxed([-size; 3], [size; 3]);
+            let (minimum, share) = POSITION_BOX_ALLOWANCE;
+            let allowed = (share * original.size.unwrap()).max(minimum);
+            let noise = allowed * 0.25;
+            let noisy = boxed([-size + noise; 3], [size + noise; 3]);
+            assert_eq!(
+                match_bodies(&[noisy], std::slice::from_ref(&original)),
+                Outcome::Matches
+            );
+            // The centre is unchanged; a bound beyond the allowance still differs.
+            let enlarged = boxed([-size - allowed * 1.1; 3], [size + allowed * 1.1; 3]);
+            assert!(matches!(match_bodies(&[enlarged], &[original]),
+                Outcome::Differs(why) if why.contains("box differs")));
+        }
+    }
+
+    #[test]
+    fn measured_noise_matches_but_real_position_and_box_errors_differ() {
+        for (size, difference, matches) in [
+            (40.0, 4.0, false),
+            (38.0, 0.0022, true),
+            (400.0, 0.05, true),
+            (400.0, 1.0, false),
+        ] {
+            // These side lengths give a diagonal of exactly `size`.
+            let [x, y, z] = [size * 2.0 / 3.0, size * 2.0 / 3.0, size / 3.0];
+            let original = boxed([0.0; 3], [x, y, z]);
+            let shifted = boxed([difference, 0.0, 0.0], [x + difference, y, z]);
+            // Change the bounds without moving the centre, to exercise both checks.
+            let enlarged = boxed([-difference, 0.0, 0.0], [x + difference, y, z]);
+            for (replayed, reason) in [(shifted, "position"), (enlarged, "box")] {
+                let outcome = match_bodies(&[replayed], std::slice::from_ref(&original));
+                if matches {
+                    assert_eq!(
+                        outcome,
+                        Outcome::Matches,
+                        "size {size}, difference {difference}"
+                    );
+                } else {
+                    assert!(
+                        matches!(outcome, Outcome::Differs(why) if why.contains(reason)),
+                        "size {size}, difference {difference}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bodies_pair_by_position_even_when_volume_order_changes() {
+        let left = boxed([0.0; 3], [10.0, 20.0, 30.0]);
+        let mut right = boxed([50.0, 0.0, 0.0], [60.0, 20.0, 30.0]);
+        right.volume += 0.01;
+        let mut replayed_left = left.clone();
+        replayed_left.volume += 0.02;
+        assert_eq!(
+            match_bodies(&[right.clone(), replayed_left], &[left, right]),
+            Outcome::Matches
+        );
+    }
+
+    #[test]
+    fn bodies_at_the_same_position_pair_by_volume() {
+        let small = boxed([0.0; 3], [10.0, 20.0, 30.0]);
+        let mut large = small.clone();
+        large.volume *= 2.0;
+        assert_eq!(
+            match_bodies(&[large.clone(), small.clone()], &[small, large]),
+            Outcome::Matches
+        );
+    }
+
+    #[test]
+    fn a_body_without_a_box_uses_volume_and_area_only() {
+        let original = boxed([0.0; 3], [10.0, 20.0, 30.0]);
+        let mut no_box = original.clone();
+        no_box.bounds = None;
+        no_box.center = None;
+        no_box.size = None;
+        assert_eq!(
+            match_bodies(
+                std::slice::from_ref(&no_box),
+                std::slice::from_ref(&original)
+            ),
+            Outcome::Matches
+        );
+        assert_eq!(
+            match_bodies(
+                std::slice::from_ref(&original),
+                std::slice::from_ref(&no_box)
+            ),
+            Outcome::Matches
+        );
+        no_box.area = Some(2000.0);
+        assert!(
+            matches!(match_bodies(std::slice::from_ref(&no_box), std::slice::from_ref(&original)),
+            Outcome::Differs(why) if why.contains("area"))
+        );
+        no_box.volume = 5000.0;
+        assert!(matches!(match_bodies(&[no_box], &[original]),
+            Outcome::Differs(why) if why.contains("volume")));
     }
 
     #[test]
@@ -2267,9 +2954,19 @@ mod tests {
         });
         let eval = parse(&value).unwrap();
         assert_eq!(eval.volumes(), [1000.0, 24.0]);
+
+        // An open body: SolidCraft 0.23 and newer give it no volume.
+        let open = serde_json::json!({"bodies": [{"name": "Skin", "area_mm2": 314.0},
+            {"name": "Other", "volume_mm3": null, "area_mm2": 10.0}], "timeline": []});
+        assert_eq!(parse(&open).unwrap().volumes(), [0.0, 0.0]);
+        let malformed = serde_json::json!({"bodies": [{"volume_mm3": "big"}], "timeline": []});
+        assert!(parse(&malformed).is_err());
         assert_eq!(eval.bodies[0].area, None);
         assert_eq!(eval.bodies[1].area, Some(52.0));
         assert_eq!(eval.bodies[1].size, Some(7.0));
+        assert_eq!(eval.bodies[0].bounds, None);
+        assert_eq!(eval.bodies[1].center, Some([1.0, 1.5, 3.0]));
+        assert_eq!(eval.bodies[1].bounds, Some(([0.0; 3], [2.0, 3.0, 6.0])));
         assert_eq!(
             eval.errors,
             ["feature \"Extrude1\" failed: profile not closed"]
@@ -2463,19 +3160,29 @@ mod cli_tests {
         let dir = tempfile::tempdir().unwrap();
         let program = dir.path().join("dutchman");
         assert_eq!(beside(&program), None);
-        let cli = version_script(dir.path(), "solidcraft-cli", "solidcraft-cli 0.30.0");
+        let cli = version_script(dir.path(), "solidcraft-cli", "solidcraft-cli 0.44.0");
         assert_eq!(beside(&program), Some(cli));
     }
 
     #[test]
     fn a_chosen_cli_must_answer_as_solidcraft() {
         let dir = tempfile::tempdir().unwrap();
-        let cli = version_script(dir.path(), "solidcraft-cli", "solidcraft-cli 0.30.0");
+        let cli = version_script(dir.path(), "solidcraft-cli", "solidcraft-cli 0.44.0");
         assert_eq!(chosen_cli(&cli), Ok(cli));
         let other = version_script(dir.path(), "other-tool", "other-tool 1.2.3");
         assert!(chosen_cli(&other)
             .unwrap_err()
             .contains("did not answer as solidcraft-cli"));
+    }
+
+    #[test]
+    fn a_chosen_cli_older_than_the_oldest_supported_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = version_script(dir.path(), "solidcraft-cli", "solidcraft-cli 0.17.0");
+        let why = chosen_cli(&cli).unwrap_err();
+        assert!(why.contains("older than SolidCraft 0.18 patch 2"), "{why}");
+        let floor = version_script(dir.path(), "floor", "solidcraft-cli 0.18.2");
+        assert_eq!(chosen_cli(&floor), Ok(floor));
     }
 
     #[test]
@@ -2493,7 +3200,7 @@ mod cli_tests {
         .unwrap();
         std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(chosen_cli(&app).unwrap_err().contains("portable ZIP"));
-        let cli = version_script(dir.path(), "solidcraft-cli", "solidcraft-cli 0.30.1");
+        let cli = version_script(dir.path(), "solidcraft-cli", "solidcraft-cli 0.44.1");
         assert_eq!(chosen_cli(&app), Ok(cli));
         assert!(!started.exists());
     }
@@ -2794,8 +3501,8 @@ mod cli_tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         for version in [
-            "0.18.2", "0.20.0", "0.25.1", "0.27.1", "0.30.0", "0.30.9", "0.31.0", "nonsense",
-            "0.17.0",
+            "0.18.2", "0.20.0", "0.25.1", "0.27.1", "0.40.0", "0.41.0", "0.42.0", "0.43.0",
+            "0.44.0", "0.44.9", "0.45.0", "nonsense", "0.17.0",
         ] {
             let cli = dir.path().join(version);
             std::fs::write(
@@ -2912,13 +3619,117 @@ mod version_tests {
     use super::*;
 
     #[test]
+    fn new_history_paths_flatten_below_the_release_window() {
+        for gate in [VersionGate::HistoryBody, VersionGate::SplitFaces] {
+            assert!(!gate.supported("0.18.2".parse().unwrap()));
+            assert!(!gate.supported("0.39.0".parse().unwrap()));
+            assert!(gate.supported(SolidCraftVersion::V0_40_0));
+        }
+        assert!(target_loses_history("0.39.0".parse().unwrap()));
+    }
+
+    #[test]
+    fn target_040_keeps_030_writer_capabilities() {
+        let target: SolidCraftVersion = "0.40.0".parse().unwrap();
+        for gate in [
+            VersionGate::EntryRecessTip,
+            VersionGate::ConePrimitive,
+            VersionGate::SketchProfileCoil,
+            VersionGate::MirrorChain,
+        ] {
+            assert_eq!(
+                gate.supported(target),
+                gate.supported(SolidCraftVersion::V0_30_0)
+            );
+        }
+        assert_eq!(target.extension(), SolidCraftVersion::V0_30_0.extension());
+        // Scoped extrude bodies need 0.44, so every earlier target keeps less history.
+        assert!(target_loses_history(target));
+    }
+
+    #[test]
+    fn target_041_keeps_040_writer_capabilities() {
+        let target: SolidCraftVersion = "0.41.0".parse().unwrap();
+        let previous: SolidCraftVersion = "0.40.0".parse().unwrap();
+        for gate in [
+            VersionGate::EntryRecessTip,
+            VersionGate::ConePrimitive,
+            VersionGate::SketchProfileCoil,
+            VersionGate::MirrorChain,
+        ] {
+            assert_eq!(gate.supported(target), gate.supported(previous));
+        }
+        assert_eq!(target.extension(), previous.extension());
+        // Scoped extrude bodies need 0.44, so every earlier target keeps less history.
+        assert!(target_loses_history(target));
+    }
+
+    #[test]
+    fn target_042_keeps_041_writer_capabilities() {
+        let target: SolidCraftVersion = "0.42.0".parse().unwrap();
+        let previous: SolidCraftVersion = "0.41.0".parse().unwrap();
+        for gate in [
+            VersionGate::EntryRecessTip,
+            VersionGate::ConePrimitive,
+            VersionGate::SketchProfileCoil,
+            VersionGate::MirrorChain,
+        ] {
+            assert_eq!(gate.supported(target), gate.supported(previous));
+        }
+        assert_eq!(target.extension(), previous.extension());
+        // Scoped extrude bodies need 0.44, so every earlier target keeps less history.
+        assert!(target_loses_history(target));
+    }
+
+    #[test]
+    fn target_043_keeps_042_writer_capabilities() {
+        let target: SolidCraftVersion = "0.43.0".parse().unwrap();
+        let previous: SolidCraftVersion = "0.42.0".parse().unwrap();
+        for gate in [
+            VersionGate::EntryRecessTip,
+            VersionGate::ConePrimitive,
+            VersionGate::SketchProfileCoil,
+            VersionGate::MirrorChain,
+        ] {
+            assert_eq!(gate.supported(target), gate.supported(previous));
+        }
+        assert_eq!(target.extension(), previous.extension());
+        // Scoped extrude bodies need 0.44, so every earlier target keeps less history.
+        assert!(target_loses_history(target));
+    }
+
+    #[test]
+    fn target_044_keeps_043_writer_capabilities() {
+        let target: SolidCraftVersion = "0.44.0".parse().unwrap();
+        let previous: SolidCraftVersion = "0.43.0".parse().unwrap();
+        for gate in [
+            VersionGate::EntryRecessTip,
+            VersionGate::ConePrimitive,
+            VersionGate::SketchProfileCoil,
+            VersionGate::MirrorChain,
+        ] {
+            assert_eq!(gate.supported(target), gate.supported(previous));
+        }
+        assert_eq!(target.extension(), previous.extension());
+        assert!(!target_loses_history(target));
+        assert!(!VersionGate::ScopedBodies.supported(previous));
+        assert!(VersionGate::ScopedBodies.supported(target));
+        assert!(!VersionGate::ClosedCircleBlend.supported(target));
+        assert!(VersionGate::ClosedCircleBlend.supported(SolidCraftVersion::V0_44_1));
+    }
+
+    #[test]
     fn minor_status_preserves_patch_sensitive_writer_rules() {
         for (found, status) in [
             ("0.27.0", "current"),
             ("0.27.9", "current"),
-            ("0.30.0", "current"),
-            ("0.30.9", "current"),
-            ("0.31.0", "newer"),
+            ("0.40.0", "current"),
+            ("0.41.0", "current"),
+            ("0.42.0", "current"),
+            ("0.43.0", "current"),
+            ("0.44.0", "current"),
+            ("0.44.9", "current"),
+            ("0.45.0", "newer"),
             ("0.17.99", "too_old"),
         ] {
             assert_eq!(
@@ -2930,9 +3741,15 @@ mod version_tests {
         let after: SolidCraftVersion = "0.25.1".parse().unwrap();
         assert_eq!(before.minor(), after.minor());
         assert!(target_loses_history(before));
-        assert!(!target_loses_history(after));
+        assert!(VersionGate::MirrorChain.supported(after));
+        // Both lose the 0.44 scoped bodies; the patch release still adds its own gate.
+        assert!(target_loses_history(after));
+        assert!(!VersionGate::SketchProfileCoil.supported(before));
+        assert!(VersionGate::SketchProfileCoil.supported(after));
         assert!(!VersionGate::EntryRecessTip.supported("0.22.0".parse().unwrap()));
         assert!(VersionGate::EntryRecessTip.supported(SolidCraftVersion::V0_22_1));
+        assert!(!VersionGate::ClosedCircleBlend.supported("0.44.0".parse().unwrap()));
+        assert!(VersionGate::ClosedCircleBlend.supported(SolidCraftVersion::V0_44_1));
         assert!("0.18.1".parse::<SolidCraftVersion>().is_err());
         assert!("0.18.2".parse::<SolidCraftVersion>().is_ok());
         assert_ne!(
@@ -2940,4 +3757,21 @@ mod version_tests {
             "too_old"
         );
     }
+}
+
+#[cfg(target_family = "wasm")]
+fn version_of(_: &Path) -> Result<Option<String>, String> {
+    Ok(None)
+}
+#[cfg(target_family = "wasm")]
+pub fn solidcraft_version(_: &Verification) -> Option<String> {
+    None
+}
+#[cfg(target_family = "wasm")]
+pub fn cached_solidcraft_version(_: &Verification) -> Option<String> {
+    None
+}
+#[cfg(target_family = "wasm")]
+fn reg_query(_: &str, _: &str, _: &str) -> Option<String> {
+    None
 }

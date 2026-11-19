@@ -10,7 +10,7 @@ report (replace `part.f3d` with your file or folder):
 dutchman convert-all --out-dir converted --report-anon report-anon.json part.f3d
 ```
 
-In the desktop app, **Report anonymously on GitHub** on the failed file (under **Help us fix it**)
+In the desktop app, **GitHub issue** in **Is there a problem? Is something missing?**
 does this for you. Review
 `report-anon.json`, then paste it into the
 [**A file didn't convert**](https://github.com/dutchman-cad/dutchman/issues/new?template=file-did-not-convert.yml)
@@ -18,7 +18,10 @@ form on Dutchman's issues (for a whole library, the **Library test report** form
 ordinary logs, JSON output, the journal, the report key, and the salt private: they contain
 names, paths, or a way to identify files. Keep the original design private. You may attach a
 small rebuilt reproduction only if it reproduces and you are free to share it. See
-[Testing Dutchman on your library](testing-your-library.md#5-report-what-you-found).
+[Report what you found](testing-your-library.md#5-report-what-you-found) for the three
+required versions and [Want to go further?](testing-your-library.md#want-to-go-further)
+for the four optional tiers, which use only a synthetic reproduction; an agent asks once how
+far to go.
 
 On Linux, run `dutchman-gui` from a terminal and confirm that your X11 or Wayland desktop
 session has working OpenGL and graphics drivers. Include the terminal diagnostics when
@@ -104,7 +107,8 @@ in the source usually avoids it.
 
 If a file opens in the app that made it but Dutchman can't convert it, it's a bug in Dutchman,
 and the file is the quickest way to fix it. A failed file's card in the desktop and web apps
-has the steps (in the desktop app, open **Help us fix it** under **Review and send report**):
+has the steps (in the desktop app, in **Is there a problem? Is something missing?** at the bottom
+left; **Report this file…** on a card chooses that file):
 
 1. **Join our Discord server.** Already in? Skip this step.
 2. **DM Dutchy.** The button copies a message and opens Dutchy's DM. Paste the message.
@@ -114,13 +118,14 @@ has the steps (in the desktop app, open **Help us fix it** under **Review and se
    - A file of up to 10 MB: drag it in. The desktop app opens its folder.
    - A larger file: Dutchy replies with a private upload link, for up to 300 MB for the design,
      300 MB for its STEP, or a 1.5 GB zip, for 72 hours.
-3. **Have a STEP export?** If you can export a STEP of the same design, add it too. It helps us
-   compare, but it isn't required.
+3. **Please add a STEP export.** Strongly recommended: a STEP export of the exact same design
+   (same version, part positions and state) lets us check every part. It really helps us fix it.
 
 Only the Dutchman team sees it. It's never published or used in public tests, and we delete it
 on request.
 
-To send no file, use **Report anonymously on GitHub** instead: no file, no names.
+The secondary pills are **Anonymous report** (review before direct cloud upload) and
+**GitHub issue** (a public issue under your GitHub username).
 
 ## When you can't share the file
 
@@ -260,6 +265,11 @@ Without an assistant, choose **Diagnose this file** on the desktop failure card,
 With dutchman-mcp configured locally, paste this prompt and substitute your local paths:
 
 > Use Dutchman's anonymous diagnostic tools on INPUT, writing local results under OUT.
+> Run dutchman --version and solidcraft-cli --version if installed, using its full path
+> or SOLIDCRAFT_CLI if needed; record "none" if no SolidCraft was installed. Copy the
+> report's versions block verbatim for any issue draft, and add those outputs separately.
+> State the source program/version from metadata already reported by Dutchman; ask me once
+> if missing. If exact builds are unknown, give the program, desktop or web, and file years.
 > Start with diagnose_narrow; it resumes a stopped run and checks shipped known problems.
 > Explain any workaround first. If useful, try convert_part with the anonymous part number,
 > optionally with neighbours, and stop_at_feature to test a history prefix. Show me the
@@ -269,6 +279,9 @@ With dutchman-mcp configured locally, paste this prompt and substitute your loca
 > use make_report to prepare the local ZIP. Tell me where to review it locally. Do not read
 > local-key.json, the original file, the rebuilt file or the ZIP into the conversation.
 > Do not upload anything or open a submission link; I will review and choose what to send.
+> End by showing the remaining tiers from "Want to go further?" in Testing Dutchman on your
+> library and asking once: "How far do you want me to go? (stop here / Tier 2 / Tier 3 / all the way)";
+> then do every tier up to my answer without asking again, and stop early only if a tier fails or needs something from me (such as my GitHub login or a small design rebuilt by hand).
 
 The assistant sees categories, counts and signatures. The report ZIP itself contains the
 small file's geometry. A broad matching error category alone does not prove the same

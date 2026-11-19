@@ -235,6 +235,8 @@ pub fn report(
 /// Where to write an anonymous report, and with what salt.
 #[derive(Clone, Debug)]
 pub struct Request {
+    /// Use the counts-only profile, without file ids or a private key.
+    pub counts: bool,
     /// The report's file.
     pub path: PathBuf,
     /// The salt for its file ids; a new one when `None`.
@@ -346,7 +348,17 @@ fn write_run(
         Some(salt) => salt.clone(),
         None => Salt::random()?,
     };
-    let (anon, key) = report(batch, inputs, out_dir, &salt, run);
+    let (anon, key) = if request.counts {
+        if request.key.is_some() {
+            return Err("Counts reports do not use a private key.".into());
+        }
+        (
+            serde_json::to_value(crate::counts::report(batch)).map_err(|err| err.to_string())?,
+            BTreeMap::new(),
+        )
+    } else {
+        report(batch, inputs, out_dir, &salt, run)
+    };
     let save = |path: &Path, value: &Value| {
         let text = serde_json::to_string_pretty(value).map_err(|err| err.to_string())?;
         std::fs::write(path, text + "\n").map_err(|err| format!("{}: {err}", path.display()))
@@ -1279,6 +1291,49 @@ mod tests {
         // What is left still says what happened.
         assert!(text.contains("files in the project have this name; used"));
         assert!(text.contains("is not mapped yet"));
+    }
+
+    #[test]
+    fn a_left_out_stuck_design_is_named_nowhere_in_the_report() {
+        let root = Path::new("/home/someone/CAD");
+        let entry = "Secret Gearbox 7.f3d";
+        let limits = crate::worker::Limits::default();
+        let mut converted = json!({"ok": true,
+            "input": {"path": root.join("Plant.f3z"), "format": "fusion_archive"},
+            "mode": "import", "verification": {"status": "flattened", "reason": "x"},
+            "losses": []});
+        crate::worker::mark_left_out(
+            &mut converted,
+            &root.join("Plant.f3z"),
+            &[entry.into()],
+            &limits,
+        );
+        let mut failed = json!({"ok": false,
+            "input": {"path": root.join("Mill.f3z"), "format": "fusion_archive"},
+            "error": {"message": "cannot read this design", "stage": "decode"}});
+        crate::worker::mark_left_out(
+            &mut failed,
+            &root.join("Mill.f3z"),
+            &[entry.into()],
+            &limits,
+        );
+        assert!(converted.to_string().contains(entry) && failed.to_string().contains(entry));
+        let batch = json!({"results": [converted, failed], "skipped": 0});
+        let salt = Salt::random().unwrap();
+        let (anon, _) = report(
+            &batch,
+            &[root.to_path_buf()],
+            &root.join("out"),
+            &salt,
+            &Run::default(),
+        );
+        let mut text = String::new();
+        all_text(&anon, &mut text);
+        for name in [entry, "Secret Gearbox", "Gearbox"] {
+            assert!(!text.contains(name), "{name} is in the report:\n{text}");
+        }
+        // What is left still says what happened.
+        assert!(text.contains("was left out"), "{text}");
     }
 
     #[test]

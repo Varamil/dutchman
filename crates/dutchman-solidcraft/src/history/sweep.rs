@@ -19,7 +19,7 @@ const WHOLE: f64 = 1e-9;
 /// Maps a sweep feature whose operation is `definition`.
 pub(crate) fn map(feature: &Value, definition: &Value, ctx: &mut Context) -> Result<Value, String> {
     let shape = definition.get("shape").unwrap_or(&Value::Null);
-    let surface = match shape.get("mode").and_then(Value::as_str) {
+    let surface = match shape.get("kind").and_then(Value::as_str) {
         Some("solid") => false,
         Some("surface") => true,
         _ => return Err("its swept shape is not resolved".to_owned()),
@@ -57,7 +57,24 @@ pub(crate) fn map(feature: &Value, definition: &Value, ctx: &mut Context) -> Res
         .ok_or("its sketch is not an earlier mapped sketch")?
         .feature;
 
-    let (path_sketch, path) = curves(definition.get("path"), ctx, "path")?;
+    let topological =
+        definition.pointer("/path/kind").and_then(Value::as_str) == Some("historical_edges");
+    let (path_sketch, path, edges) = if topological {
+        if !crate::VersionGate::TopologicalEdges.supported(ctx.target_version) {
+            return Err("sweep paths of input edges need SolidCraft 0.44 or newer; choose a newer target to keep this feature editable".to_owned());
+        }
+        let selection = definition.get("path").ok_or("it has no path")?;
+        let (inputs, points) = super::blend::historical(feature, selection, ctx, false)?;
+        super::blend::connected(&inputs)?;
+        if let Some((sketch, path)) = super::edge_path::sketch(feature, selection, &inputs, ctx)? {
+            (Some(sketch), path, None)
+        } else {
+            (None, Vec::new(), Some((inputs, points)))
+        }
+    } else {
+        let (sketch, path) = curves(definition.get("path"), ctx, "path")?;
+        (Some(sketch), path, None)
+    };
     whole(definition.get("path_extent"), "path")?;
 
     let mut extra = Map::new();
@@ -156,6 +173,7 @@ pub(crate) fn map(feature: &Value, definition: &Value, ctx: &mut Context) -> Res
     };
     let body_names = body_names(feature, ctx, operation);
 
+    ctx.topological_replay_required |= topological;
     let id = ctx.id();
     ctx.builds = true;
     let mut out = json!({
@@ -165,11 +183,29 @@ pub(crate) fn map(feature: &Value, definition: &Value, ctx: &mut Context) -> Res
         "suppressed": false,
         "sketch": sketch,
         "profiles": profiles,
-        "path_sketch": path_sketch,
-        "path": path,
         "operation": operation,
     });
     if let Some(fields) = out.as_object_mut() {
+        if let Some((inputs, points)) = edges {
+            // Body-edge paths leave the sketch-path fields empty in the saved feature.
+            fields.insert("path_sketch".to_owned(), json!(0));
+            fields.insert("path".to_owned(), json!([]));
+            fields.insert("path_edges".to_owned(), json!(points));
+            ctx.blends.push(super::blend::Pending {
+                feature: 0,
+                outcome: 0,
+                subject: String::new(),
+                edges: inputs,
+                angle_chamfer: false,
+                face: None,
+                extra: None,
+                trimmed: false,
+                path: true,
+            });
+        } else {
+            fields.insert("path_sketch".to_owned(), json!(path_sketch));
+            fields.insert("path".to_owned(), json!(path));
+        }
         if surface {
             fields.remove("operation");
         }
@@ -218,7 +254,7 @@ pub(super) fn curves(
             .and_then(Value::as_str)
             .and_then(|id| mapped.curve(id))
             .ok_or_else(|| format!("its {what} uses a curve the sketch does not carry"))?;
-        return Ok((mapped.feature, vec![curve.id.clone()]));
+        return Ok((mapped.feature, curve.ids()));
     }
     match path.get("kind").and_then(Value::as_str) {
         Some("sketch_curves") => {}
@@ -263,11 +299,11 @@ pub(super) fn curves(
             entity
                 .as_str()
                 .and_then(|entity| mapped.curve(entity))
-                .map(|curve| curve.id.clone())
+                .map(|curve| curve.ids())
                 .ok_or_else(|| format!("its {what} uses a curve the sketch does not carry"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok((mapped.feature, ids))
+    Ok((mapped.feature, ids.into_iter().flatten().collect()))
 }
 
 /// The SolidCraft sketch feature and wire ids of curves picked in a 3D sketch.

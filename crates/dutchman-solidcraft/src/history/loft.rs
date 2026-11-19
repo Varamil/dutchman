@@ -13,10 +13,52 @@
 use serde_json::{json, Value};
 
 use super::extrude::{body_names, operation};
-use super::profile::profile;
+use super::profile::{profile, profile_count};
 use super::sketch::v3;
+use super::sketch::{Mapped, Shape};
 use super::sweep::curves;
 use super::{name, Context};
+
+/// Why a loft over a spline written as exact pieces is refused: a loft runs its surface
+/// through each section's edges, so more edges would make another surface (and can stall
+/// SolidCraft), even though each piece is exact.
+const SPLIT: &str = "lofts through a spline written as exact pieces are not mapped yet: the \
+pieces would change the lofted surface";
+
+/// Why a loft section that takes several of a sketch's loops is refused: the source's loft can
+/// fill the outer loop where the loops read as a ring, so neither reading is proven.
+const SEVERAL_LOOPS: &str = "a loft section that takes several loops of its sketch is not mapped \
+yet: whether the inner loops are holes in the lofted shape is not known";
+
+/// How many of its sketch's loops a section selects, when it selects whole loops by kind
+/// (the whole sketch, or a list of its profiles). Other selections name their regions.
+fn loops_selected(section: &Value, ctx: &Context) -> usize {
+    let section = super::profile::planar(section);
+    let value = section.get("value");
+    match section.get("kind").and_then(Value::as_str) {
+        Some("sketch") => value
+            .and_then(Value::as_str)
+            .map_or(0, |sketch| profile_count(ctx, sketch)),
+        Some("sketch_profiles") => value
+            .and_then(|value| value.get("profiles"))
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
+        _ => 0,
+    }
+}
+
+/// Whether `sketch` carries a spline split into exact pieces, among the curves `ids` when given.
+fn split_spline(sketch: &Mapped, ids: Option<&[&str]>) -> bool {
+    sketch.shapes.values().any(|shape| match shape {
+        Shape::Curve(curve) if !curve.pieces.is_empty() => ids.is_none_or(|ids| {
+            curve
+                .pieces
+                .iter()
+                .any(|piece| ids.contains(&piece.id.as_str()))
+        }),
+        _ => false,
+    })
+}
 
 /// Maps a loft feature whose operation is `definition`, appending any apex sketches
 /// to `preceding` only once the complete loft has mapped.
@@ -30,7 +72,7 @@ pub(crate) fn map(
     let guides = match guidance.get("kind").and_then(Value::as_str) {
         None => &[][..],
         Some("guides") => guidance
-            .get("path")
+            .get("value")
             .and_then(Value::as_array)
             .map_or(&[][..], Vec::as_slice),
         Some("centerline") => return Err("lofts along a centreline are not mapped yet".to_owned()),
@@ -46,6 +88,22 @@ pub(crate) fn map(
                 .map(|(sketch, curves)| json!({"sketch": sketch, "curves": curves}))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    for rail in &rails {
+        let feature = rail.get("sketch").and_then(Value::as_u64);
+        let ids: Vec<&str> = rail
+            .get("curves")
+            .and_then(Value::as_array)
+            .map(|ids| ids.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        if ctx
+            .sketches
+            .values()
+            .filter(|mapped| Some(mapped.feature) == feature)
+            .any(|mapped| split_spline(mapped, Some(&ids)))
+        {
+            return Err(SPLIT.to_owned());
+        }
+    }
     let flag = |key: &str, default: bool| {
         definition
             .get(key)
@@ -79,6 +137,9 @@ pub(crate) fn map(
     let mut sections = Vec::with_capacity(sources.len());
     let mut apex_sketches = Vec::new();
     for (index, section) in sources.iter().enumerate() {
+        let section = section
+            .get("value")
+            .ok_or("its loft section has no value")?;
         if matches!(
             section.get("kind").and_then(Value::as_str),
             Some("point" | "native_point" | "vertex")
@@ -130,11 +191,17 @@ pub(crate) fn map(
             sections.push(json!({"sketch": id, "point": "origin", "profiles": {"type": "all"}}));
             continue;
         }
+        if loops_selected(section, ctx) > 1 {
+            return Err(SEVERAL_LOOPS.to_owned());
+        }
         let (sketch_id, profiles) = profile(Some(section), ctx)?;
         let sketch = ctx
             .sketches
             .get(&sketch_id)
             .ok_or("a section's sketch is not an earlier mapped sketch")?;
+        if split_spline(sketch, None) {
+            return Err(SPLIT.to_owned());
+        }
         sections.push(json!({"sketch": sketch.feature, "profiles": profiles}));
     }
     // A surface loft is a sheet of its own; SolidCraft makes it a new surface body.
@@ -168,4 +235,50 @@ pub(crate) fn map(
     }
     preceding.extend(apex_sketches);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::super::sketch::{Curve, Mapped, Shape};
+
+    fn curve(id: &str, pieces: Vec<Curve>) -> Curve {
+        Curve {
+            pieces,
+            index: 0,
+            id: id.to_owned(),
+            kind: "spline",
+            start: None,
+            end: None,
+            center: None,
+        }
+    }
+
+    fn sketch(shapes: Vec<(&str, Curve)>) -> Mapped {
+        Mapped {
+            feature: 7,
+            normal: [0.0, 0.0, 1.0],
+            origin: [0.0; 3],
+            x_dir: [1.0, 0.0, 0.0],
+            y_dir: [0.0, 1.0, 0.0],
+            point_displacement: 0.0,
+            points: Vec::new(),
+            shapes: shapes
+                .into_iter()
+                .map(|(id, c)| (id.to_owned(), Shape::Curve(c)))
+                .collect::<BTreeMap<_, _>>(),
+        }
+    }
+
+    #[test]
+    fn a_loft_section_or_rail_through_a_split_spline_is_found() {
+        let split = curve("s1", vec![curve("s1", vec![]), curve("s2", vec![])]);
+        let mapped = sketch(vec![("whole", split), ("line", curve("l1", vec![]))]);
+        assert!(super::split_spline(&mapped, None));
+        assert!(super::split_spline(&mapped, Some(&["s2"])));
+        assert!(!super::split_spline(&mapped, Some(&["l1"])));
+        let plain = sketch(vec![("one", curve("s1", vec![]))]);
+        assert!(!super::split_spline(&plain, None));
+    }
 }

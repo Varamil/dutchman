@@ -13,8 +13,9 @@ dutchman convert-all --out-dir converted --report-anon report-anon.json part.f3d
 ```
 
 Replace `part.f3d` with your file or folder. Review `report-anon.json`, then open an issue
-with the cause, counts, and versions it records. Ordinary logs, JSON output, and journals
-contain file names and paths; keep them, the report key, and the salt private.
+with the cause, counts, and versions it records. Include the three required versions
+as described in [Report what you found](docs/testing-your-library.md#5-report-what-you-found).
+Ordinary logs, JSON output, and journals contain file names and paths; keep them, the report key, and the salt private.
 
 Keep the original design private. You may attach a small rebuilt reproduction if it
 reproduces and you are free to share it; follow the
@@ -25,8 +26,10 @@ from libraries. See
 
 Always report it here, on Dutchman, even when the report names cadmpeg or SolidCraft (an
 `upstream` field, or a `f3d/…`, `inventor/…` or `sldprt/…` loss code). Don't file it on cadmpeg
-or SolidCraft yourself: we work out where the fix belongs, take it upstream, and tell you here
-when a Dutchman release has it. [docs/triage.md](docs/triage.md) says how.
+or SolidCraft for the initial report: we work out where the fix belongs, take it upstream,
+and tell you here when a Dutchman release has it. To help with a fix, choose the
+[optional contribution tiers](docs/testing-your-library.md#want-to-go-further), using only
+synthetic files. [docs/triage.md](docs/triage.md) says how reports are handled.
 
 To test Dutchman on a whole library of your own without sharing a file, see
 [Testing Dutchman on your library](docs/testing-your-library.md) and its issue form.
@@ -42,15 +45,30 @@ cargo build --release
 Before you open a pull request, run the checks CI runs (`.github/workflows/ci.yml`):
 
 ```sh
+scripts/solidcraft-window.sh --print
+python3 scripts/check-version-gates.py --base HEAD
+python3 -m unittest discover -s scripts/tests -v
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-CI runs the debug-profile tests on Linux (x86_64 and ARM64), Windows and macOS, and checks that the workspace builds with
-Rust 1.88. A further job opens every converted fixture in a released SolidCraft
-(`scripts/solidcraft-roundtrip.sh`) and replays the history tests in it. It is informational
-and does not block a merge. To run it locally, put a SolidCraft release's `solidcraft-cli`
+Pull requests and merge groups run formatting, Linux Clippy and x86_64 tests (or the
+focused docs tests), release notes, changelog and version gates. Code merge groups also build
+the shared Linux CLI/server programs and run the small railcore and robot-arm placement checks.
+Windows, macOS, ARM64, Rust 1.88, WebAssembly, SolidCraft round trips (including 0.18.2),
+Voron placements and Docker images run after merge on main, nightly, on tags and by hand.
+Platform-only breaks are caught on main right after merge instead of before.
+ARM CI links test programs with LLD and records link durations in the job summary.
+The required `ci-result` enforces the Linux set before merge and the full matrix elsewhere;
+unexpected skips fail it. A failing main check opens or updates one main CI issue, which closes
+when a newer main run is green. Reports follow the newest completed push run of this workflow;
+moving main ahead while a run is still running does not discard its result. Release tags must
+pass the full CI matrix on their exact commit before packaging or creating a release. To run
+everything on a branch before queueing,
+use `gh workflow run ci.yml --ref <branch>`; opt into release archives with `-f release-builds=true`.
+Packaging paths and the former `release-build` label do not start full builds on PRs.
+To run a round trip locally, put a SolidCraft release's `solidcraft-cli`
 where `SOLIDCRAFT_CLI` points:
 
 ```sh
@@ -124,9 +142,9 @@ checks them. The optimised programs (thin LTO, the same `dutchman`, `dutchman-mc
   commit and day it took.
 - a release candidate (`rc`, or a tag such as `v0.2.8-rc.1`): the full release build of a
   candidate tag, kept for 30 days.
-- a pull request: its full build, which exists only for packaging changes, the `release-build`
-  label, or a run started by hand (`gh pr edit 123 --add-label release-build`, or
-  `gh workflow run release-build.yml --ref my-branch`). The script says so when it has none.
+- a pull request: its full build, started by hand with
+  `gh workflow run release-build.yml --ref my-branch`. A full CI dispatch also builds release
+  artifacts, under the CI run in Actions. Packaging changes and labels do not start builds on PRs.
 
 To try a change without building it:
 
@@ -167,6 +185,27 @@ artifact has lost its executable bit, so `chmod +x` the programs.
    Run `python3 scripts/changelog.py check` and `python3 scripts/changelog.py preview`.
 5. Open the pull request against `main` and make sure CI passes.
 
+A few things reviewers ask about most:
+
+- **SolidCraft versions.** Keep the 0.18.2 opens-in floor, its CI job and all existing writer checks.
+  Before starting, run `scripts/solidcraft-window.sh --print`: new work targets only newest plus releases
+  published in the last 14 days. Never back-port features or add gates older than that window;
+  flatten new features for older targets with a named reason, keeping the file opening.
+- **Keep the default output.** A new behaviour that changes what an existing file converts to
+  (orientation, units, placement, names) is opt-in behind a flag, and the default output stays
+  the same. Change a golden file or a placement expectation only when the change means to, and
+  say why in the pull request.
+- **Checks compare with the source.** Blend proving, the partial-history body comparison and the
+  SolidCraft replay compare the written design with the source's coordinates, so a change that
+  transforms the whole output applies it only where the final file is written, after them.
+- **Land what works.** If your change needs an unmerged cadmpeg change, keep it as a draft until
+  cadmpeg merges it and Dutchman's pin includes it, then switch everything on in one pull
+  request. No commented-out code, ignored tests, or docs announcing what the build can't do yet.
+- **Measure numbers that drive decisions**, such as the memory and time estimates in
+  `crates/dutchman/src/choices.rs`, and put the measurements in the pull request.
+- **Changelog fragments are for users:** one to three short bullets on what they get. Detail
+  belongs in the docs.
+
 Write commit messages and pull request titles in the imperative, in sentence case, saying
 what changes for the user: "Map patterns of features", "Convert SolidWorks parts".
 
@@ -180,14 +219,17 @@ There is no separate contributor agreement or sign-off.
 
 Proprietary formats are decoded from public information and from files their owners made
 themselves, never from leaked or confidential material, decompiled programs, or someone
-else's private designs. Native decoding belongs in cadmpeg, not in Dutchman.
+else's private designs. Native decoding belongs in cadmpeg, not in Dutchman: reading any part
+of a native file's bytes (a zip member, a stream such as `BulkStream.dat`, a table) is
+decoding, and goes there.
 
 - Don't add code, test files or documentation that comes from another CAD program's source,
   SDK samples or help, or from material under a confidentiality agreement.
 - Don't add third-party CAD files: no designs from model libraries, vendors, employers or
   customers.
 - New test files are synthetic: built in code, or taken from cadmpeg's public test suite, with
-  their origin written down in `crates/dutchman-core/tests/fixtures/README.md`.
+  their origin written down in `crates/dutchman-core/tests/fixtures/README.md`: the merged
+  cadmpeg commit and path a file was copied from, or how it was generated.
 - Tests for bugs found on private files use generic dimensions and synthetic geometry: never
   copy a private design's numbers, names or shapes into a test.
 
@@ -207,7 +249,8 @@ SolidCraft round trip and the anonymous-report leak check first (docs/releasing.
 ## Adding a format
 
 Dutchman never parses a native format itself. A new format starts in cadmpeg: once cadmpeg
-publishes a codec for it, Dutchman can convert it.
+publishes a codec for it, Dutchman can convert it. Open the Dutchman pull request when the
+codec is merged into cadmpeg's `main` and the pin includes it, or keep it as a draft until then.
 
 1. Turn the codec on in the `cadmpeg-registry` features in the workspace `Cargo.toml`.
 2. Add the format to `Format` in `crates/dutchman-core/src/format.rs` (its id, extension,

@@ -111,9 +111,7 @@ fn converts_an_edrawings_assembly(stem: &str, min_occurrences: usize) {
     );
 
     // Payload names depend on cadmpeg's STEP writer, not on the document.
-    let mut pretty = serde_json::to_string_pretty(&document).unwrap()
-        + "
-";
+    let mut pretty = serde_json::to_string_pretty(&document).unwrap() + "\n";
     for (index, blob) in names.iter().filter(|n| n.starts_with("blobs/")).enumerate() {
         pretty = pretty.replace(blob.as_str(), &format!("blobs/<sha256-{index}>.step"));
     }
@@ -244,7 +242,7 @@ fn interchange_codecs_convert_generated_geometry_through_step() {
     use cadmpeg_registry::{build_encoder, Format};
     let dir = tempfile::tempdir().unwrap();
     let mut ir = cadmpeg_ir::examples::unit_cube().unwrap();
-    for face in &mut ir.model.faces {
+    for face in &mut ir.geometry.faces {
         face.name = None;
     }
     for (format, extension) in [(Format::Step, "stp"), (Format::Rhino, "3dm")] {

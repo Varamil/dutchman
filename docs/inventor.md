@@ -5,8 +5,10 @@ Dutchman reads Inventor through cadmpeg's Inventor codec (cadmpeg-registry's
 when the pin is bumped. This page says what Dutchman makes of what that codec gives, and which
 upstream gaps keep Inventor history from replaying. It drives what is asked of cadmpeg next.
 
-State as of the cadmpeg commit Dutchman pins (`f9d0a14`, cadmpeg 0.6.11; see `Cargo.toml`). From that
-commit more Inventor fillet forms decode instead of staying native.
+State as of the cadmpeg commit Dutchman pins (`651fe819`, cadmpeg 0.6.11; see `Cargo.toml`).
+Fixed-spacing rectangular body patterns and more face operands now decode, and resolved
+split targets retain their earlier body producer for history mapping. Body patterns still
+need earlier mapped body names; feature-local body selections remain unsupported.
 
 ## Parts (`.ipt`)
 
@@ -16,7 +18,7 @@ commit more Inventor fillet forms decode instead of staying native.
 | No geometry (empty or invalid carrier: blocking `geometry_not_transferred`). | Stops: "no geometry could be read". |
 | Parameters (closed scalar graphs, including ones whose stored unit type cadmpeg doesn't recognise). | Mapped to SolidCraft parameters. |
 | Planar sketches: points, lines, circles, ellipses, polygons, with typed and native constraints. | Mapped, ellipses as whole ellipses; typed constraints mapped, native ones reported as not carried. |
-| Uniform periodic (closed) sketch B-splines, with a full knot vector and polynomial or equal-weight poles. | Mapped exactly by endpoint knot insertion into a clamped SolidCraft control spline. Unequal weights and nonuniform or repeated interior knots are refused specifically: SolidCraft control splines store neither weights nor custom knots. |
+| Periodic (closed) sketch B-splines, with a full knot vector and polynomial or equal-weight poles. | Mapped exactly by endpoint knot insertion into a clamped SolidCraft control spline. Nonuniform spacing and repeated interior knots become chains of exact spline pieces with shared endpoints, up to 200 pieces; uniform splines stay one spline. Unequal weights remain unsupported because SolidCraft control splines have no weights. |
 | Extrude, hole, constant-radius fillet, equal-distance chamfer, when every property, dimension and selection resolves. | Extrude: mapped when cadmpeg resolves its profile to sketch profiles or regions, blind, through all, or to a resolved plane parallel to the sketch before any body-building feature (including a placed work plane); resolved parallel planar faces on earlier named bodies also map. Native face selections, tilted terminating planes, vertex selections, and to-next-face ends are not mapped yet. Holes map where their placement resolves, drilled the way the hole points; constant-radius fillets and equal-setback chamfers map with proven feature input edge geometry (see guide.md). |
 | Resolved revolve with a sketch profile, axis, and fixed angle. | Maps full turns and one-sided partial solid sweeps when selected profile bounds prove the sweep side about the oriented axis; see [revolve coverage](guide.md). |
 | Mirror of features about a work plane. | Mapped as a SolidCraft mirror pattern of those features about that plane. |
@@ -42,6 +44,36 @@ Final-body faces cannot establish that timeline state. A `from_plane` start para
 sketch maps as a start offset along the sketch normal. Tilted plane ends and native,
 generated, or historical vertex selections are not supported yet. Symmetric To Object ends
 and non-blind ends against the sketch normal on two-sided extrudes remain unsupported.
+
+On SolidCraft 0.44 and newer, the shared writer can confirm extrude body scope
+at the final body-building feature from resolved modified-body outputs and a
+matching replay against the final source geometry. Intermediate body centres
+cannot confirm scope. A consumed Combine tool without a final body row keeps
+its name only when the source retains exactly one history body whose
+`produced_by` matches its single-output producer, or a complete replay matches
+the final source geometry. Failed or unavailable checks keep the previous mapping.
+Output IDs alone do not prove identity; without proof, later selections keep the
+existing unnamed-body blocker.
+The pinned Inventor reader
+still leaves native body references unresolved; those remain blockers. Dutchman
+does not interpret the native references to infer participants.
+
+Sheet-metal attached plates with their paired bends map to SolidCraft `sheet.flange` using
+a proven point on the base sheet's actual profile edge. On SolidCraft 0.44.1, this includes
+unchanged L-shaped and notched bases with a single simple straight-sided perimeter, including
+attachments at concave edges. The plate must still be rectangular, square to the sheet, span
+its entire selected edge, share its thickness, and start at the bend end or the outer face.
+Height is measured from the outer face; bend radius comes from the paired bend. The writer
+uses the existing `sheet_flange` feature with `edges`, `height`, `angle: "90 deg"`, `radius`,
+and `position: "inside"`; no new version gate or command inputs are needed.
+
+The attachment proof refuses curved, open, crossing, disconnected, or collinear base edges,
+base profiles with holes or partial regions, and bases changed by earlier solid features.
+The report names the base-profile or selection limitation, and conversion keeps the geometry.
+Historical midpoint, tangent, and both endpoints must match the rebuilt edge; final-body
+edges and a bounding rectangle cannot establish that match. See [sheet metal](history.md#sheet-metal)
+for the remaining plate and bend limits. Synthetic CADIR tests build polygonal bases in code
+and replay L-shaped and notched examples with the released SolidCraft CLI.
 
 ## Upstream gaps, in the order they block history
 

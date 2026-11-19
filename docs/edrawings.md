@@ -1,5 +1,10 @@
 # eDrawings: what converts today, and what stands in the way
-Dutchman reads eDrawings parts (`.eprt`) and assemblies (`.easm`) through cadmpeg's
+The pinned cadmpeg revision does not include the eDrawings codec yet. Conversion is
+not supported yet in this build; the eDrawings decoding and conversion tests remain
+ignored until that upstream dependency is available. The tables below describe the
+planned conversion behavior once the codec is enabled.
+
+Dutchman will read eDrawings parts (`.eprt`) and assemblies (`.easm`) through cadmpeg's
 `edrawings` codec (cadmpeg-registry's `edrawings` feature). Improvements to eDrawings decoding
 land in cadmpeg and reach Dutchman when the pin is bumped. This page says what Dutchman makes
 of what that codec gives, and what the files cannot give at all.
